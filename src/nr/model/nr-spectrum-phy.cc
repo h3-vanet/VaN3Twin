@@ -2070,7 +2070,6 @@ NrSpectrumPhy::RxSlPscch (std::vector<uint32_t> paramIndexes)
         {
           NS_LOG_DEBUG (this << " PSCCH OK");
           std::list<PscchPduInfo>::iterator it;
-          int count = 0;
           for (it = rxControlMessageOkList.begin (); it != rxControlMessageOkList.end (); it++)
             {
               m_nrPhyRxPscchEndOkCallback (it->packet, it->psd);
