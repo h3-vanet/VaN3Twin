@@ -106,7 +106,7 @@ jobs:
       - name: Build automotive module only
         working-directory: ns-3-dev
         run: |
-          ninja -C build ns3-automotive -j2
+          cmake --build cmake-cache --target libautomotive -j2
 
       - name: Show ccache stats
         run: |
