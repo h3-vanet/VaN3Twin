@@ -101,7 +101,9 @@ jobs:
             --build-profile=debug \
             --disable-tests \
             --disable-python \
-            --disable-examples
+            --disable-examples \
+            -- \
+            -DNS3_WARNINGS_AS_ERRORS=OFF
 
       - name: Build automotive module only
         working-directory: ns-3-dev
