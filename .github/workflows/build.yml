@@ -87,6 +87,13 @@ jobs:
           cp src/automotive/model/TxTracker/channel_files/modified/yans-wifi-phy.h \
              src/wifi/model/
 
+          for tag in rssi-tag sinr-tag rsrp-tag timestamp-tag size-tag; do
+            for stack in wifi/model cv2x/model nr/model lte/model; do
+              cp src/automotive/model/SignalInfo/${tag}.cc src/${stack}/
+              cp src/automotive/model/SignalInfo/${tag}.h  src/${stack}/
+            done
+          done
+
       - name: Configure ns-3
         working-directory: ns-3-dev
         run: |
