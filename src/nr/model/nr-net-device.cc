@@ -25,6 +25,8 @@
 #include "nr-net-device.h"
 #include <ns3/ipv6-l3-protocol.h>
 #include <ns3/ipv6-header.h>
+#include <ns3/simulator.h>
+#include <iostream>
 
 namespace ns3 {
 
@@ -213,7 +215,18 @@ NrNetDevice::Receive (Ptr<Packet> p)
     }
   else
     {
-      NS_ABORT_MSG ("NrNetDevice::Receive - Unknown IP type...");
+      // A packet that is neither IPv4 nor IPv6 can legitimately reach a node
+      // that was shut down at runtime (late sidelink delivery); drop it
+      // instead of aborting the whole simulation.
+      static uint64_t g_nrUnknownL3Drops = 0;
+      ++g_nrUnknownL3Drops;
+      std::cerr << "[nr-drop] t=" << Simulator::Now ().GetSeconds ()
+                << " uid=" << p->GetUid ()
+                << " size=" << p->GetSize ()
+                << " node=" << (GetNode () ? GetNode ()->GetId () : uint32_t (-1))
+                << " total=" << g_nrUnknownL3Drops << std::endl;
+      NS_LOG_WARN ("NrNetDevice::Receive - dropping non-IP packet (uid="
+                   << p->GetUid () << ", size=" << p->GetSize () << ")");
     }
 }
 
