@@ -38,12 +38,63 @@
 #include "ns3/timestamp-tag.h"
 #include "ns3/rsrp-tag.h"
 #include "ns3/size-tag.h"
+#include <iostream>
 
 
 namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE ("NrSpectrumPhy");
 NS_OBJECT_ENSURE_REGISTERED (NrSpectrumPhy);
+
+namespace {
+
+// Cumulative sidelink PSSCH/PSCCH counters for per-run PLR reporting.
+// Observational only: printed on std::cerr so post-processing can grep
+// "[nr-plr]" regardless of the NS_LOG configuration/build profile.
+struct NrSlPlrCounters
+{
+  uint64_t tx = 0;
+  uint64_t rxOk = 0;
+  uint64_t rxKo = 0;
+  uint64_t pscchOk = 0;
+  uint64_t pscchKo = 0;
+  bool reporterArmed = false;
+};
+
+NrSlPlrCounters g_nrSlPlr;
+
+void
+NrSlPlrPrint ()
+{
+  std::cerr << "[nr-plr] t=" << Simulator::Now ().GetSeconds ()
+            << " tx=" << g_nrSlPlr.tx
+            << " rx_ok=" << g_nrSlPlr.rxOk
+            << " rx_ko=" << g_nrSlPlr.rxKo
+            << " pscch_ok=" << g_nrSlPlr.pscchOk
+            << " pscch_ko=" << g_nrSlPlr.pscchKo << std::endl;
+}
+
+void
+NrSlPlrPeriodicReport ()
+{
+  NrSlPlrPrint ();
+  Simulator::Schedule (Seconds (10), &NrSlPlrPeriodicReport);
+}
+
+// Lazily start the periodic report chain on the first counted event, and
+// register a final report at Simulator::Destroy.
+void
+NrSlPlrArmReporter ()
+{
+  if (!g_nrSlPlr.reporterArmed)
+    {
+      g_nrSlPlr.reporterArmed = true;
+      Simulator::Schedule (Seconds (10), &NrSlPlrPeriodicReport);
+      Simulator::ScheduleDestroy (&NrSlPlrPrint);
+    }
+}
+
+} // namespace
 
 std::ostream&
 operator<<(std::ostream &os, const enum NrSpectrumPhy::State state)
@@ -1728,6 +1779,9 @@ NrSpectrumPhy::StartTxSlDataFrames (const Ptr<PacketBurst>& pb, Time duration)
         txParams->nodeId = GetDevice ()->GetNode ()->GetId ();
         txParams->packetBurst = pb;
 
+        NrSlPlrArmReporter ();
+        ++g_nrSlPlr.tx;
+
         m_txDataTrace (duration);
 
         if (m_channel)
@@ -2049,6 +2103,8 @@ NrSpectrumPhy::RxSlPscch (std::vector<uint32_t> paramIndexes)
           traceParams.m_tbler = 0;
         }
       traceParams.m_corrupt = corrupt;
+      NrSlPlrArmReporter ();
+      corrupt ? ++g_nrSlPlr.pscchKo : ++g_nrSlPlr.pscchOk;
       traceParams.m_symStart = tag.GetSymStart (); //DATA symbol start
       traceParams.m_numSym = tag.GetNumSym (); //DATA symbol length
       traceParams.m_bwpId = GetBwpId ();
@@ -2389,6 +2445,8 @@ NrSpectrumPhy::RxSlPssch (std::vector<uint32_t> paramIndexes)
       traceParams.m_rbAssignedNum = rbBitmapSize;
       traceParams.m_dstL2Id = sciF2a.GetDstId ();
       traceParams.m_srcL2Id = sciF2a.GetSrcId ();
+      NrSlPlrArmReporter ();
+      tbIt.second.isDataCorrupted ? ++g_nrSlPlr.rxKo : ++g_nrSlPlr.rxOk;
       m_rxPsschTraceUe (traceParams);
       // Now dispatch the non corrupted TBs to UE PHY
       if (!tbIt.second.isDataCorrupted)
