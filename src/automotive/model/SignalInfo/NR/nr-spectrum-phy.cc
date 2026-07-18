@@ -56,8 +56,6 @@ struct NrSlPlrCounters
   uint64_t tx = 0;
   uint64_t rxOk = 0;
   uint64_t rxKo = 0;
-  uint64_t pscchOk = 0;
-  uint64_t pscchKo = 0;
   bool reporterArmed = false;
 };
 
@@ -69,9 +67,7 @@ NrSlPlrPrint ()
   std::cerr << "[nr-plr] t=" << Simulator::Now ().GetSeconds ()
             << " tx=" << g_nrSlPlr.tx
             << " rx_ok=" << g_nrSlPlr.rxOk
-            << " rx_ko=" << g_nrSlPlr.rxKo
-            << " pscch_ok=" << g_nrSlPlr.pscchOk
-            << " pscch_ko=" << g_nrSlPlr.pscchKo << std::endl;
+            << " rx_ko=" << g_nrSlPlr.rxKo << std::endl;
 }
 
 void
@@ -2103,8 +2099,6 @@ NrSpectrumPhy::RxSlPscch (std::vector<uint32_t> paramIndexes)
           traceParams.m_tbler = 0;
         }
       traceParams.m_corrupt = corrupt;
-      NrSlPlrArmReporter ();
-      corrupt ? ++g_nrSlPlr.pscchKo : ++g_nrSlPlr.pscchOk;
       traceParams.m_symStart = tag.GetSymStart (); //DATA symbol start
       traceParams.m_numSym = tag.GetNumSym (); //DATA symbol length
       traceParams.m_bwpId = GetBwpId ();
@@ -2447,8 +2441,15 @@ NrSpectrumPhy::RxSlPssch (std::vector<uint32_t> paramIndexes)
       traceParams.m_rbAssignedNum = rbBitmapSize;
       traceParams.m_dstL2Id = sciF2a.GetDstId ();
       traceParams.m_srcL2Id = sciF2a.GetSrcId ();
-      NrSlPlrArmReporter ();
-      tbIt.second.isDataCorrupted ? ++g_nrSlPlr.rxKo : ++g_nrSlPlr.rxOk;
+      // Count only real TB receptions: SCI-2 travels with the data on the
+      // PSSCH, so a node that decoded it is genuinely receiving this TB.
+      // SCI-1-only far listeners (expected-TB entries whose data+SCI-2 both
+      // fail at distance) are monitoring occasions, not receptions.
+      if (!tbIt.second.isSci2Corrupted)
+        {
+          NrSlPlrArmReporter ();
+          tbIt.second.isDataCorrupted ? ++g_nrSlPlr.rxKo : ++g_nrSlPlr.rxOk;
+        }
       m_rxPsschTraceUe (traceParams);
       // Now dispatch the non corrupted TBs to UE PHY
       if (!tbIt.second.isDataCorrupted)
