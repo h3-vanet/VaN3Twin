@@ -7,6 +7,7 @@
 #include "ns3/packet.h"
 #include "ns3/string.h"
 #include "ns3/uinteger.h"
+#include "ns3/simulator.h"
 
 namespace ns3 {
 
@@ -60,8 +61,13 @@ V2xGossipApp::StopApplication()
 {
   if (m_socket)
     {
-      m_socket->Close();
+      // Stop RX immediately, but defer Close() by one event cycle: an
+      // Ipv4EndPoint::DoForwardUp already scheduled in this same simulation
+      // step would otherwise run on a deallocated endpoint (use-after-free).
       m_socket->SetRecvCallback(MakeNullCallback<void, Ptr<Socket>>());
+      m_socket->ShutdownRecv();
+      Ptr<Socket> sock = m_socket;
+      Simulator::Schedule(MilliSeconds(1), [sock]() { sock->Close(); });
       m_socket = nullptr;
     }
 }

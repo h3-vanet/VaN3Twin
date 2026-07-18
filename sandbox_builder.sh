@@ -165,7 +165,7 @@ set -v
 cd ns-3-dev
 cp src/automotive/propagation-extended/cni-urbanmicrocell-propagation-loss-model.cc src/propagation/model/
 cp src/automotive/propagation-extended/cni-urbanmicrocell-propagation-loss-model.h src/propagation/model/
-cp src/automotive/propagation-ehttps://github.com/h3-vanet/VaN3Twinxtended/CMakeLists.txt src/propagation/
+cp src/automotive/propagation-extended/CMakeLists.txt src/propagation/
 if [ "$ENABLE_SIONNA" = "1" ]; then
 	echo "Copying propagation files for NVIDIA Sionna..."
 	sleep 1

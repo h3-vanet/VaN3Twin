@@ -893,7 +893,7 @@ public:
   void ClearExpectedSlTb ();
 
   void EmptyRsrpArray() {m_rsrp_array.clear();};
-  double AvgRsrpArray() {return std::reduce(m_rsrp_array.begin(), m_rsrp_array.end()) / m_rsrp_array.size();};
+  double AvgRsrpArray() {return m_rsrp_array.empty() ? 0.0 : std::reduce(m_rsrp_array.begin(), m_rsrp_array.end()) / m_rsrp_array.size();};
   void InsertRsrpArray(double rsrp) {m_rsrp_array.push_back (rsrp);};
 
 private:
