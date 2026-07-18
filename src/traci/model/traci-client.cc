@@ -455,21 +455,34 @@ namespace ns3
         NS_LOG_INFO("Used the following command to start up sumo: " << m_sumoCommand);
       }
 
-    // wait 1 sec (=1e6 microsec) until sumo opens socket for traci connection
-    std::cout << "Sumo: wait for socket: " << m_sumoWaitForSocket.GetSeconds() << "s" << std::endl;
-    usleep(m_sumoWaitForSocket.GetMicroSeconds());
-
-    // connect to sumo via traci
-    try
-      {
-        // this->TraCIAPI::connect("172.23.208.1", m_sumoPort); // <- to connect to the Windows version of SUMO under WSL2 (Windows "host IP" needs to be customized)
-        this->TraCIAPI::connect("localhost", m_sumoPort);
-      }
-    catch (std::exception& e)
-      {
-        terminateVehicleVisualizer();
-        NS_FATAL_ERROR("Can not connect to sumo via traci: " << e.what());
-      }
+    // Connect to sumo via traci, retrying every second up to
+    // m_sumoWaitForSocket (at least 10 s): a single blind sleep+connect
+    // fails spuriously when SUMO loads a large net slowly (e.g. on Lustre).
+    {
+      int maxAttempts = std::max (10, static_cast<int> (m_sumoWaitForSocket.GetSeconds ()));
+      std::cout << "Sumo: wait for socket: up to " << maxAttempts << "s" << std::endl;
+      bool connected = false;
+      for (int attempt = 1; attempt <= maxAttempts && !connected; ++attempt)
+        {
+          usleep (1000000);
+          try
+            {
+              this->TraCIAPI::connect ("localhost", m_sumoPort);
+              connected = true;
+            }
+          catch (std::exception& e)
+            {
+              if (attempt == maxAttempts)
+                {
+                  terminateVehicleVisualizer ();
+                  NS_FATAL_ERROR ("Can not connect to sumo via traci after "
+                                  << maxAttempts << " attempts: " << e.what ());
+                }
+              std::cout << "Sumo: connect attempt " << attempt << "/" << maxAttempts
+                        << " failed, retrying..." << std::endl;
+            }
+        }
+    }
 
     // ZMQ base ports (configurable via env) + the same offset parsed above.
     const int portPub       = envInt("ZMQ_PUB_PORT",        5555) + zmqPortOffset;
