@@ -43,6 +43,10 @@ namespace ns3
 
   CABasicService::~CABasicService() {
     // std::cout << "Wannabe Sent: " << m_wannabe_sent << std::endl;
+    // Cancel pending events so they cannot fire on freed memory
+    m_event_camDisseminationStart.Cancel();
+    m_event_camCheckConditions.Cancel();
+    m_event_camRsuDissemination.Cancel();
     NS_LOG_INFO("CABasicService object destroyed.");
   }
 

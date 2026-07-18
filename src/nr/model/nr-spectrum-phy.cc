@@ -2114,8 +2114,9 @@ NrSpectrumPhy::RxSlPscch (std::vector<uint32_t> paramIndexes)
       traceParams.m_maxNumPerReserve = sciHeader.GetSlMaxNumPerReserve ();
       traceParams.m_dstL2Id = tag.GetDstL2Id ();
       uint32_t rbBitmapSize = static_cast<uint32_t> (m_slRxSigParamInfo.at (paramIndex).rbBitmap.size ());
-      traceParams.m_rbStart = m_slRxSigParamInfo.at (paramIndex).rbBitmap.at (0);
-      traceParams.m_rbEnd = m_slRxSigParamInfo.at (paramIndex).rbBitmap.at (rbBitmapSize - 1);
+      // Guard against an empty bitmap (desynced bookkeeping on late RX)
+      traceParams.m_rbStart = rbBitmapSize > 0 ? m_slRxSigParamInfo.at (paramIndex).rbBitmap.at (0) : 0;
+      traceParams.m_rbEnd = rbBitmapSize > 0 ? m_slRxSigParamInfo.at (paramIndex).rbBitmap.at (rbBitmapSize - 1) : 0;
       traceParams.m_rbAssignedNum = rbBitmapSize;
       m_rxPscchTraceUe (traceParams);
     }
@@ -2440,8 +2441,9 @@ NrSpectrumPhy::RxSlPssch (std::vector<uint32_t> paramIndexes)
       traceParams.m_numSym = tbIt.second.expectedTb.numSym;
       traceParams.m_bwpId = GetBwpId ();
       uint32_t rbBitmapSize = static_cast<uint32_t> (tbIt.second.expectedTb.rbBitmap.size ());
-      traceParams.m_rbStart = tbIt.second.expectedTb.rbBitmap.at (0);
-      traceParams.m_rbEnd = tbIt.second.expectedTb.rbBitmap.at (rbBitmapSize - 1);
+      // Guard against an empty bitmap (desynced bookkeeping on late RX)
+      traceParams.m_rbStart = rbBitmapSize > 0 ? tbIt.second.expectedTb.rbBitmap.at (0) : 0;
+      traceParams.m_rbEnd = rbBitmapSize > 0 ? tbIt.second.expectedTb.rbBitmap.at (rbBitmapSize - 1) : 0;
       traceParams.m_rbAssignedNum = rbBitmapSize;
       traceParams.m_dstL2Id = sciF2a.GetDstId ();
       traceParams.m_srcL2Id = sciF2a.GetSrcId ();
