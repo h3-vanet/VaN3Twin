@@ -61,6 +61,10 @@ struct NrSlPlrCounters
 
 NrSlPlrCounters g_nrSlPlr;
 
+// Cumulative count of SL transmissions dropped because the PHY was receiving
+// (half-duplex). Emitted per-event on std::cerr as "[nr-txdrop]".
+uint64_t g_txWhileRxDrops = 0;
+
 void
 NrSlPlrPrint ()
 {
@@ -1702,7 +1706,12 @@ NrSpectrumPhy::StartTxSlCtrlFrames (const Ptr<PacketBurst>& pb, Time duration)
     case RX_DL_CTRL:
       /* no break */
     case RX_UL_CTRL:
-      NS_FATAL_ERROR ("Cannot TX while RX.");
+      // Same half-duplex collision as StartTxSlDataFrames: the PSCCH (SCI) is
+      // the first var-TTI of a grant, so it hits this state first. Drop it
+      // without aborting or changing state; the accompanying PSSCH var-TTI
+      // that follows is where the lost grant is counted ([nr-txdrop]), keeping
+      // the counter grant-granular and consistent with the tx counter.
+      NS_LOG_WARN ("NR SL CTRL TX dropped: PHY in RX state " << m_state);
       break;
     case TX:
       NS_FATAL_ERROR ("Cannot TX while already TX.");
@@ -1754,7 +1763,20 @@ NrSpectrumPhy::StartTxSlDataFrames (const Ptr<PacketBurst>& pb, Time duration)
     case RX_DL_CTRL:
       /* no break */
     case RX_UL_CTRL:
-      NS_FATAL_ERROR ("Cannot TX while RX.");
+      {
+        // Half-duplex collision: with sensing disabled the SL scheduler can
+        // grant a TX overlapping an ongoing RX on the same UE (no half-duplex
+        // exclusion in NrSlUeMac::GetNrSlTxOpportunities). Drop this grant's
+        // transmission instead of aborting the run and leave the state
+        // untouched so the ongoing RX completes. This is real emergent
+        // half-duplex loss, counted (not hidden) for post-processing.
+        std::cerr << "[nr-txdrop] TX-while-RX dropped (sim_t="
+                  << Simulator::Now ().GetSeconds ()
+                  << ", node=" << GetDevice ()->GetNode ()->GetId ()
+                  << ", size=" << (pb ? pb->GetSize () : 0)
+                  << ", total=" << ++g_txWhileRxDrops << ")" << std::endl;
+        NS_LOG_WARN ("NR SL DATA TX dropped: PHY in RX state " << m_state);
+      }
       break;
     case TX:
       NS_FATAL_ERROR ("Cannot TX while already TX.");
