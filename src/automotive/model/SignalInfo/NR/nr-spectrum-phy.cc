@@ -65,6 +65,10 @@ NrSlPlrCounters g_nrSlPlr;
 // (half-duplex). Emitted per-event on std::cerr as "[nr-txdrop]".
 uint64_t g_txWhileRxDrops = 0;
 
+// Defensive tripwire: PSSCH param-index entries that are not valid indices
+// into m_slRxSigParamInfo. Emitted on std::cerr as "[nr-slrx-drop]".
+uint64_t g_slRxIndexDrops = 0;
+
 void
 NrSlPlrPrint ()
 {
@@ -2180,9 +2184,27 @@ NrSpectrumPhy::RxSlPssch (std::vector<uint32_t> paramIndexes)
   rsrp.Set (avg_rsrpDbm);
   EmptyRsrpArray();
 
-  for (uint32_t i = 0; i < m_slRxSigParamInfo.size (); i++)
+  // Iterate over the PSSCH param indices, NOT over m_slRxSigParamInfo: the
+  // latter also holds the PSCCH (ctrl) entries, so bounding the loop by its
+  // size and indexing paramIndexes[i] read out of bounds whenever a slot
+  // carried both ctrl and data frames (the common case under dense traffic),
+  // an out-of-bounds heap read that manifested as a bare SIGSEGV after long
+  // dense runs. paramIndexes.size() is the correct bound (cf. RxSlPscch).
+  for (uint32_t i = 0; i < paramIndexes.size (); i++)
     {
       uint32_t pktIndex = paramIndexes [i];
+
+      if (pktIndex >= m_slRxSigParamInfo.size ())
+        {
+          // Defensive tripwire: a param index must address a real received
+          // frame. If not (bookkeeping desync), drop it instead of an
+          // out-of-bounds access.
+          std::cerr << "[nr-slrx-drop] sim_t=" << Simulator::Now ().GetSeconds ()
+                    << " node=" << GetDevice ()->GetNode ()->GetId ()
+                    << " pktIndex=" << pktIndex
+                    << " total=" << ++g_slRxIndexDrops << std::endl;
+          continue;
+        }
 
       std::list<Ptr<Packet> >::const_iterator j = m_slRxSigParamInfo.at (pktIndex).params->packetBurst->Begin ();
       //Even though there may be multiple data packets, they all have
