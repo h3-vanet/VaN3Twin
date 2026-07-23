@@ -1706,12 +1706,19 @@ NrSpectrumPhy::StartTxSlCtrlFrames (const Ptr<PacketBurst>& pb, Time duration)
     case RX_DL_CTRL:
       /* no break */
     case RX_UL_CTRL:
-      // Same half-duplex collision as StartTxSlDataFrames: the PSCCH (SCI) is
-      // the first var-TTI of a grant, so it hits this state first. Drop it
-      // without aborting or changing state; the accompanying PSSCH var-TTI
-      // that follows is where the lost grant is counted ([nr-txdrop]), keeping
-      // the counter grant-granular and consistent with the tx counter.
-      NS_LOG_WARN ("NR SL CTRL TX dropped: PHY in RX state " << m_state);
+      {
+        // Same half-duplex collision as StartTxSlDataFrames: the PSCCH (SCI)
+        // is the first var-TTI of a grant, so it hits an RX state first. Drop
+        // it without aborting or changing state so the ongoing RX completes.
+        // Counted (kind=ctrl) alongside the PSSCH drop (kind=data): both are
+        // real dropped SL transmissions of the lost grant.
+        std::cerr << "[nr-txdrop] kind=ctrl sim_t="
+                  << Simulator::Now ().GetSeconds ()
+                  << " node=" << GetDevice ()->GetNode ()->GetId ()
+                  << " size=" << (pb ? pb->GetSize () : 0)
+                  << " total=" << ++g_txWhileRxDrops << std::endl;
+        NS_LOG_WARN ("NR SL CTRL TX dropped: PHY in RX state " << m_state);
+      }
       break;
     case TX:
       NS_FATAL_ERROR ("Cannot TX while already TX.");
@@ -1770,11 +1777,11 @@ NrSpectrumPhy::StartTxSlDataFrames (const Ptr<PacketBurst>& pb, Time duration)
         // transmission instead of aborting the run and leave the state
         // untouched so the ongoing RX completes. This is real emergent
         // half-duplex loss, counted (not hidden) for post-processing.
-        std::cerr << "[nr-txdrop] TX-while-RX dropped (sim_t="
+        std::cerr << "[nr-txdrop] kind=data sim_t="
                   << Simulator::Now ().GetSeconds ()
-                  << ", node=" << GetDevice ()->GetNode ()->GetId ()
-                  << ", size=" << (pb ? pb->GetSize () : 0)
-                  << ", total=" << ++g_txWhileRxDrops << ")" << std::endl;
+                  << " node=" << GetDevice ()->GetNode ()->GetId ()
+                  << " size=" << (pb ? pb->GetSize () : 0)
+                  << " total=" << ++g_txWhileRxDrops << std::endl;
         NS_LOG_WARN ("NR SL DATA TX dropped: PHY in RX state " << m_state);
       }
       break;
