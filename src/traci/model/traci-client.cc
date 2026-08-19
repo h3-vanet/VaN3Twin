@@ -411,7 +411,7 @@ namespace ns3
 
     // sumo additional command line options
     m_sumoCommand += " " + m_sumoAddCmdOpt;
-    m_sumoCommand += " --start --quit-on-end &";
+    m_sumoCommand += " --start &";
 
     return m_sumoCommand;
   }
