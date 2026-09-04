@@ -1812,14 +1812,6 @@ NrSpectrumPhy::StartTxSlDataFrames (const Ptr<PacketBurst>& pb, Time duration)
         NrSlPlrArmReporter ();
         ++g_nrSlPlr.tx;
 
-        // Coverage-probe hook: no-op unless NrSlBeaconCoverageEnable() was
-        // called (e.g. from a scenario's --beacon-node-id CLI arg).
-        if (NrSlBeaconCoverageIsEnabled ()
-            && txParams->nodeId == NrSlBeaconCoverageGetBeaconNodeId ())
-          {
-            NrSlBeaconCoverageNotifyTx ();
-          }
-
         m_txDataTrace (duration);
 
         if (m_channel)

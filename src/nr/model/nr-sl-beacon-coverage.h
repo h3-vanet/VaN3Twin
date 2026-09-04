@@ -14,17 +14,22 @@ namespace ns3 {
  * functions are no-ops, so runs that don't use this feature are
  * unaffected.
  *
- * NrSlBeaconCoverageNotifyTx() marks the start of a new transmission
- * sequence and clears the decoder set. NrSlBeaconCoverageNotifyDecoded()
- * records a receiving node id as having decoded the current sequence.
- * NrSlBeaconCoverageGetSnapshot() reads back the current sequence number
- * and its distinct-decoder count.
+ * NrSlBeaconCoverageStartNewBeacon() marks the start of a new logical
+ * beacon and clears the decoder set. Call it once per application-layer
+ * beacon send, NOT from the PHY TX path: with EnableBlindReTx, a single
+ * logical beacon produces multiple NrSpectrumPhy::StartTxSlDataFrames
+ * calls (initial + up to slMaxTxTransNumPssch-1 blind retransmissions),
+ * so resetting there would clear legitimate decodes recorded between
+ * copies of the *same* beacon. NrSlBeaconCoverageNotifyDecoded() records
+ * a receiving node id as having decoded the current beacon (any one of
+ * its copies). NrSlBeaconCoverageGetSnapshot() reads back the current
+ * sequence number and its distinct-decoder count.
  */
 void NrSlBeaconCoverageEnable (uint32_t beaconNodeId);
 bool NrSlBeaconCoverageIsEnabled (void);
 uint32_t NrSlBeaconCoverageGetBeaconNodeId (void);
 
-void NrSlBeaconCoverageNotifyTx (void);
+void NrSlBeaconCoverageStartNewBeacon (void);
 void NrSlBeaconCoverageNotifyDecoded (uint32_t rxNodeId);
 
 struct NrSlBeaconCoverageSnapshot

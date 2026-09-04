@@ -36,8 +36,12 @@ NrSlBeaconCoverageGetBeaconNodeId (void)
 }
 
 void
-NrSlBeaconCoverageNotifyTx (void)
+NrSlBeaconCoverageStartNewBeacon (void)
 {
+  if (!g_enabled)
+    {
+      return;
+    }
   ++g_seq;
   g_decoders.clear ();
 }
