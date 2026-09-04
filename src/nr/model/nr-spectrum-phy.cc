@@ -34,6 +34,7 @@
 #include <unordered_set>
 #include "nr-sl-sci-f1a-header.h"
 #include "nr-sl-sci-f2a-header.h"
+#include "nr-sl-beacon-coverage.h"
 #include "ns3/sinr-tag.h"
 #include "ns3/timestamp-tag.h"
 #include "ns3/rsrp-tag.h"
@@ -1811,6 +1812,14 @@ NrSpectrumPhy::StartTxSlDataFrames (const Ptr<PacketBurst>& pb, Time duration)
         NrSlPlrArmReporter ();
         ++g_nrSlPlr.tx;
 
+        // Coverage-probe hook: no-op unless NrSlBeaconCoverageEnable() was
+        // called (e.g. from a scenario's --beacon-node-id CLI arg).
+        if (NrSlBeaconCoverageIsEnabled ()
+            && txParams->nodeId == NrSlBeaconCoverageGetBeaconNodeId ())
+          {
+            NrSlBeaconCoverageNotifyTx ();
+          }
+
         m_txDataTrace (duration);
 
         if (m_channel)
@@ -2500,6 +2509,20 @@ NrSpectrumPhy::RxSlPssch (std::vector<uint32_t> paramIndexes)
         {
           NrSlPlrArmReporter ();
           tbIt.second.isDataCorrupted ? ++g_nrSlPlr.rxKo : ++g_nrSlPlr.rxOk;
+
+          // Coverage-probe hook: per-(tx,rx) successful decode of the
+          // designated beacon node's broadcasts. No-op unless
+          // NrSlBeaconCoverageEnable() was called. tx id comes from the
+          // signal parameters stamped at TX time (StartTxSlDataFrames),
+          // not tbIt.first (that's the TX UE's RNTI, a different
+          // namespace than ns-3 Node ID).
+          if (!tbIt.second.isDataCorrupted
+              && NrSlBeaconCoverageIsEnabled ()
+              && m_slRxSigParamInfo.at (tbIt.second.pktIndex).params->nodeId
+                   == NrSlBeaconCoverageGetBeaconNodeId ())
+            {
+              NrSlBeaconCoverageNotifyDecoded (GetDevice ()->GetNode ()->GetId ());
+            }
         }
       m_rxPsschTraceUe (traceParams);
       // Now dispatch the non corrupted TBs to UE PHY
