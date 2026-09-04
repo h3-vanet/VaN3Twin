@@ -30,12 +30,14 @@
 #include "ns3/mobility-module.h"
 #include "ns3/point-to-point-module.h"
 #include "ns3/nr-module.h"
+#include "ns3/nr-sl-beacon-coverage.h"
 #include "ns3/lte-module.h"
 #include "ns3/stats-module.h"
 #include "ns3/config-store-module.h"
 #include "ns3/log.h"
 #include "ns3/antenna-module.h"
 #include <iomanip>
+#include <unordered_set>
 #include <unistd.h>
 #include "ns3/sumo_xml_parser.h"
 #include "ns3/vehicle-visualizer-module.h"
@@ -91,6 +93,29 @@ GetSlBitmapFromString (std::string slBitMapString, std::vector <std::bitset<1> >
     }
 }
 
+/**
+ * \brief Coverage-probe beacon: send a small fixed-size datagram over the
+ *        sidelink groupcast bearer, then reschedule itself.
+ *
+ * Off by default (only ever scheduled when --beacon is passed). Mirrors
+ * the self-reschedule pattern used by [nr-plr]'s periodic reporter in
+ * nr-spectrum-phy.cc, at 1 Hz instead of 1/10 Hz.
+ *
+ * Calls NrSlBeaconCoverageStartNewBeacon() exactly once per invocation,
+ * i.e. once per logical beacon — deliberately NOT from the PHY TX path
+ * (NrSpectrumPhy::StartTxSlDataFrames), which fires once per MAC-layer
+ * transmission *attempt* and would fire multiple times per logical
+ * beacon under EnableBlindReTx (see nr-sl-beacon-coverage.h).
+ */
+void
+ScheduleSlBeaconTx (Ptr<Socket> socket, Ipv4Address groupAddr, uint16_t port, uint32_t payloadBytes)
+{
+  NrSlBeaconCoverageStartNewBeacon ();
+  Ptr<Packet> pkt = Create<Packet> (payloadBytes);
+  socket->SendTo (pkt, 0, InetSocketAddress (groupAddr, port));
+  Simulator::Schedule (Seconds (1.0), &ScheduleSlBeaconTx, socket, groupAddr, port, payloadBytes);
+}
+
 
 int
 main (int argc, char *argv[])
@@ -116,6 +141,17 @@ main (int argc, char *argv[])
   uint32_t nodeCounter = 0;
 
   double penetrationRate = 0.7;
+
+  // Coverage-probe beacon (off by default; see TASK 1/2/3/4 of the
+  // instrumentation-survey follow-up). --beacon creates a static
+  // non-vehicle sidelink node at the map center and transmits a 1 Hz
+  // probe from it. --beacon-node-id independently selects which node id
+  // the decode-coverage counter/emitter (Tasks 3-4) tracks, so the same
+  // counting code works unchanged once a real broker node exists
+  // elsewhere: if --beacon is also given and --beacon-node-id is not
+  // explicitly set, it defaults to the probe node's own id.
+  bool enableBeacon = false;
+  int64_t beaconNodeId = -1;
 
   xmlDocPtr rou_xml_file;
   double m_baseline_prr = 150.0;
@@ -248,6 +284,17 @@ main (int argc, char *argv[])
   cmd.AddValue ("mcs",
                 "The MCS to used for sidelink",
                 mcs);
+  cmd.AddValue ("beacon",
+                "Create a static non-vehicle sidelink node at the map "
+                "center and transmit a 1 Hz coverage-probe beacon from "
+                "it (off by default)",
+                enableBeacon);
+  cmd.AddValue ("beacon-node-id",
+                "ns-3 Node ID whose sidelink broadcasts the decode-coverage "
+                "counter should track (off/disabled unless set). If "
+                "--beacon is also given and this is left unset, it "
+                "defaults to the probe node's own id",
+                beaconNodeId);
 
 
   // Parse the command line
@@ -592,6 +639,15 @@ main (int argc, char *argv[])
   stream += nrHelper->AssignStreams (allSlUesNetDeviceContainer, stream);
   stream += nrSlHelper->AssignStreams (allSlUesNetDeviceContainer, stream);
 
+  // Coverage-probe beacon node containers/socket (TASK 1/2, off by
+  // default): declared here, constructed later — see the consolidated,
+  // strictly-after-all-vehicle-construction block below, right after
+  // vehicle sidelink bearer activation.
+  NodeContainer beaconNodeContainer;
+  NetDeviceContainer beaconNetDeviceContainer;
+  Ptr<Node> beaconNode;
+  Ptr<Socket> beaconSocket;
+
   /*
    * if enableOneTxPerLane is true:
    *
@@ -651,6 +707,68 @@ main (int argc, char *argv[])
   tft = Create<LteSlTft> (LteSlTft::Direction::RECEIVE, LteSlTft::CommType::GroupCast, groupAddress4, dstL2Id);
   //Set Sidelink bearers
   nrSlHelper->ActivateNrSlBearer (slBearersActivationTime, allSlUesNetDeviceContainer, tft);
+
+  /*
+   * Coverage-probe beacon node (TASK 1/2, off by default): a single
+   * non-vehicle node, created independently of allSlUesContainer so it
+   * never consumes a nodeCounter/vehicle-pool index (see the
+   * setupNewWifiNode lambda below), given the same NR-V2X sidelink stack
+   * and TX power as the vehicles by reusing the same already-configured
+   * nrHelper/nrSlHelper/allBwps/bwpIdContainer/slPreConfigNr/internet/
+   * ipv4RoutingHelper. Its real position (map center) is set later, once
+   * sumoClient exists — see "6. Setup Traci and start SUMO" below.
+   *
+   * Placed here, strictly after every vehicle-related object-construction
+   * statement above (NR device install, AssignStreams, internet stack,
+   * bearer activation) — not interleaved with any of it — so that
+   * creating the beacon can only ever consume RNG stream numbering after
+   * every vehicle-related consumer, never in between. ns-3 assigns
+   * automatic/implicit stream indices to RandomVariableStream objects in
+   * construction order; only the indices AssignStreams() explicitly
+   * re-pins are provably order-independent, and this scenario has no
+   * explicit AssignStreams() call for the internet stack. Keeping this
+   * block last, all in one place, removes that risk by construction
+   * instead of relying on an audit of ns-3/internet-module internals.
+   */
+  if (enableBeacon)
+    {
+      beaconNodeContainer.Create (1);
+      beaconNode = beaconNodeContainer.Get (0);
+      MobilityHelper beaconMobility;
+      beaconMobility.Install (beaconNodeContainer);
+
+      beaconNetDeviceContainer = nrHelper->InstallUeDevice (beaconNodeContainer, allBwps);
+      DynamicCast<NrUeNetDevice> (beaconNetDeviceContainer.Get (0))->UpdateConfig ();
+
+      nrSlHelper->PrepareUeForSidelink (beaconNetDeviceContainer, bwpIdContainer);
+      nrSlHelper->InstallNrSlPreConfiguration (beaconNetDeviceContainer, slPreConfigNr);
+
+      stream += nrHelper->AssignStreams (beaconNetDeviceContainer, stream);
+      stream += nrSlHelper->AssignStreams (beaconNetDeviceContainer, stream);
+
+      internet.Install (beaconNodeContainer);
+      epcHelper->AssignUeIpv4Address (beaconNetDeviceContainer);
+      Ptr<Ipv4StaticRouting> beaconStaticRouting = ipv4RoutingHelper.GetStaticRouting (beaconNode->GetObject<Ipv4> ());
+      beaconStaticRouting->SetDefaultRoute (epcHelper->GetUeDefaultGatewayAddress (), 1);
+
+      // Same group/dstL2Id as the vehicles above: vehicles' existing
+      // RECEIVE bearer (just activated) already accepts this traffic, so
+      // only the beacon's own TRANSMIT (and, for stack symmetry, RECEIVE)
+      // direction needs activating here.
+      Ptr<LteSlTft> beaconTftTx = Create<LteSlTft> (LteSlTft::Direction::TRANSMIT, LteSlTft::CommType::GroupCast, groupAddress4, dstL2Id);
+      nrSlHelper->ActivateNrSlBearer (slBearersActivationTime, beaconNetDeviceContainer, beaconTftTx);
+
+      Ptr<LteSlTft> beaconTftRx = Create<LteSlTft> (LteSlTft::Direction::RECEIVE, LteSlTft::CommType::GroupCast, groupAddress4, dstL2Id);
+      nrSlHelper->ActivateNrSlBearer (slBearersActivationTime, beaconNetDeviceContainer, beaconTftRx);
+
+      // Socket created (and bound) here too, not in the post-SumoSetup
+      // block below, for the same reason: Socket::CreateSocket must not
+      // sit between vehicle construction and the per-vehicle application
+      // installs that SumoSetup()/SumoSimulationStep() trigger later.
+      beaconSocket = Socket::CreateSocket (beaconNode, UdpSocketFactory::GetTypeId ());
+      beaconSocket->SetAllowBroadcast (true);
+      beaconSocket->Bind (InetSocketAddress (Ipv4Address::GetAny (), port));
+    }
 
   // enable log component
   //LogComponentEnable("NrUeMac", LOG_LEVEL_INFO);
@@ -754,6 +872,96 @@ main (int argc, char *argv[])
 
   /* start traci client with given function pointers */
   sumoClient->SumoSetup (setupNewWifiNode, shutdownWifiNode);
+
+  // Frame size declaration (TASK 2): 1-byte UDP payload, constant size,
+  // every beacon. +8 UDP / +20 IPv4 header bytes on the wire; NR SL
+  // MAC/PHY framing (SCI, subheaders, channel coding) is on top of this
+  // and depends on the run's MCS/resource allocation, so it is not
+  // included here. Declared at this scope so both blocks below can see it.
+  const uint32_t beaconPayloadBytes = 1;
+
+  /*
+   * TASK 1 (cont'd): register the beacon node as a station now that SUMO
+   * is up, and place it at the live map center — read from TraCI's
+   * getNetBoundary() (a value, not a hardcoded constant), so this works
+   * unchanged on whatever map extent a run actually uses.
+   */
+  if (enableBeacon)
+    {
+      libsumo::TraCIPositionVector netBoundary = sumoClient->simulation.getNetBoundary ();
+      double beaconX = (netBoundary[0].x + netBoundary[1].x) / 2.0;
+      double beaconY = (netBoundary[0].y + netBoundary[1].y) / 2.0;
+      DoubleValue altitudeValue;
+      sumoClient->GetAttribute ("Altitude", altitudeValue);
+      sumoClient->AddStation ("beacon0", beaconX, beaconY, altitudeValue.Get (), beaconNode);
+
+      if (beaconNodeId < 0)
+        {
+          beaconNodeId = static_cast<int64_t> (beaconNode->GetId ());
+        }
+
+      const uint32_t beaconWireBytesPerBeacon = beaconPayloadBytes + 8 + 20;
+      std::cout << "[nr-beacon] node=" << beaconNode->GetId ()
+                << " payload=" << beaconPayloadBytes << "B"
+                << " wire~=" << beaconWireBytesPerBeacon << "B/beacon"
+                << " @1Hz => ~" << beaconWireBytesPerBeacon << " B/s"
+                << " (IPv4+UDP headers included; SL MAC/PHY framing not included)"
+                << std::endl;
+    }
+
+  /*
+   * TASK 3/4: enable the decode-coverage counter/emitter. Deliberately a
+   * separate condition from enableBeacon: this is what lets the same
+   * counting code "work unchanged once the broker node is added" (run
+   * with only --beacon-node-id=<realBrokerId>, no --beacon, once a real
+   * broker exists elsewhere in the scenario). Must run before the first
+   * ScheduleSlBeaconTx() call below, since that call's
+   * NrSlBeaconCoverageStartNewBeacon() is a no-op until Enable() has run.
+   */
+  if (beaconNodeId >= 0)
+    {
+      NrSlBeaconCoverageEnable (static_cast<uint32_t> (beaconNodeId));
+
+      sumoClient->SetPerTickCallback ([] (const std::vector<uint32_t>& liveVehicleNodeIds)
+        {
+          NrSlBeaconCoverageSnapshot snap = NrSlBeaconCoverageGetSnapshot ();
+
+          // Decoders are node ids, not yet filtered to "currently live
+          // vehicle" (see nr-sl-beacon-coverage.h): the vehicle pool has
+          // up to numberOfNodes nodes with an active sidelink stack from
+          // t=0, but only a subset are claimed/live in m_NodeMap at any
+          // tick — an unclaimed or already-parked pool node can still
+          // physically decode a broadcast it's in range of. Intersect
+          // against the live set so decoded can never exceed live.
+          std::unordered_set<uint32_t> liveSet (liveVehicleNodeIds.begin (), liveVehicleNodeIds.end ());
+          uint32_t decodedAmongLive = 0;
+          for (uint32_t nodeId : snap.decoderNodeIds)
+            {
+              if (liveSet.count (nodeId) > 0)
+                {
+                  ++decodedAmongLive;
+                }
+            }
+
+          uint32_t liveCount = static_cast<uint32_t> (liveVehicleNodeIds.size ());
+          double frac = liveCount > 0 ? static_cast<double> (decodedAmongLive) / liveCount : 0.0;
+          std::cerr << "[nr-beacon-coverage] t=" << Simulator::Now ().GetSeconds ()
+                     << " seq=" << snap.seq
+                     << " decoded=" << decodedAmongLive
+                     << " live=" << liveCount
+                     << " frac=" << frac
+                     << std::endl;
+        });
+    }
+
+  // TASK 2: arm the 1 Hz coverage-probe beacon transmission. beaconSocket
+  // was already created and bound in the consolidated pre-SumoSetup block
+  // above (see the RNG-ordering comment there); only the first
+  // transmission is kicked off here, after coverage-counting is enabled.
+  if (enableBeacon)
+    {
+      ScheduleSlBeaconTx (beaconSocket, groupAddress4, port, beaconPayloadBytes);
+    }
 
   /* Send static polygon overlays (parking spots, H3 cells, ...) to the visualizer.
    * SumoSetup() has already called sendMapDraw(), so sendPolygonUpdate() is safe to call.

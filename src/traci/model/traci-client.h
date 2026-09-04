@@ -110,6 +110,17 @@ public:
 
   void SetSionnaUp() {m_sionna = true;};
 
+  // Fired at the end of every SumoSimulationStep tick (after
+  // SynchroniseNodeMap/UpdatePositions, so m_NodeMap and positions are
+  // current), with the ns-3 Node IDs of the current live vehicles
+  // (StationType_passengerCar entries in m_NodeMap) — the full id set, not
+  // just a count, so a caller can intersect it against some other node-id
+  // set (e.g. distinct decoders of a broadcast) rather than only counting
+  // it. Stored as std::function, not a concrete callee type, for the same
+  // reason as m_includeNode/m_excludeNode/m_gossipSend above: TraciClient
+  // stays unaware of what module the callback belongs to.
+  void SetPerTickCallback (std::function<void(const std::vector<uint32_t>&)> cb);
+
 
 private:
   // perform sumo simulation for a certain time step
@@ -217,6 +228,9 @@ private:
   void   ProcessGossipIn();
   void   OnGossipReceived(const std::string& receiverSumoId,
                           const uint8_t* data, uint32_t len);
+
+  // See SetPerTickCallback().
+  std::function<void(const std::vector<uint32_t>&)> m_perTickCallback;
 
 };
 

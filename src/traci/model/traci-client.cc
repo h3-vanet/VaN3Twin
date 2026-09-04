@@ -627,6 +627,24 @@ namespace ns3
         // ask sumo for new vehicle/pedestrian positions and update node positions
         UpdatePositions();
 
+        // Per-tick hook (e.g. beacon coverage-fraction emission): fires
+        // only if a callback was registered via SetPerTickCallback(), and
+        // only after the node set/positions above are current. Denominator
+        // is live vehicles per m_NodeMap, not the raw (pool-sized,
+        // includes not-yet-spawned/already-parked slots) node container.
+        if (m_perTickCallback)
+          {
+            std::vector<uint32_t> liveVehicleNodeIds;
+            for (const auto &entry : m_NodeMap)
+              {
+                if (entry.second.first == StationType_passengerCar)
+                  {
+                    liveVehicleNodeIds.push_back (entry.second.second->GetId ());
+                  }
+              }
+            m_perTickCallback (liveVehicleNodeIds);
+          }
+
         // schedule next event to simulate next time step in sumo
         Simulator::Schedule(m_synchInterval, &TraciClient::SumoSimulationStep, this);
       }
@@ -1138,6 +1156,12 @@ std::string TraciClient::GetStationId(Ptr<Node> node)
     }
 
   return foundNode;
+}
+
+void
+TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&)> cb)
+{
+  m_perTickCallback = cb;
 }
 
   void
