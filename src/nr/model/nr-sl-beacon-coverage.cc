@@ -57,7 +57,7 @@ NrSlBeaconCoverageGetSnapshot (void)
 {
   NrSlBeaconCoverageSnapshot snap;
   snap.seq = g_seq;
-  snap.decoded = static_cast<uint32_t> (g_decoders.size ());
+  snap.decoderNodeIds.assign (g_decoders.begin (), g_decoders.end ());
   return snap;
 }
 

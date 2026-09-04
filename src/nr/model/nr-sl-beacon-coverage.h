@@ -3,6 +3,7 @@
 #define NR_SL_BEACON_COVERAGE_H
 
 #include <cstdint>
+#include <vector>
 
 namespace ns3 {
 
@@ -23,7 +24,17 @@ namespace ns3 {
  * copies of the *same* beacon. NrSlBeaconCoverageNotifyDecoded() records
  * a receiving node id as having decoded the current beacon (any one of
  * its copies). NrSlBeaconCoverageGetSnapshot() reads back the current
- * sequence number and its distinct-decoder count.
+ * sequence number and the distinct set of node ids that decoded it.
+ *
+ * That decoder set is *not* pre-filtered to "currently live vehicles":
+ * this module has no notion of TraCI/SUMO state (deliberately, to avoid
+ * a traci<->nr module dependency — see TraciClient::SetPerTickCallback).
+ * ns-3's vehicle-pool nodes (see v2v-emergencyVehicleAlert-nrv2x.cc) all
+ * get a fully active sidelink stack up front, whether or not TraCI has
+ * claimed them yet or has since released them — an unclaimed or parked
+ * node can physically decode a broadcast it's in range of just like a
+ * live one. Callers that want "fraction of *live* vehicles" must
+ * intersect this set against their own live-vehicle-id set.
  */
 void NrSlBeaconCoverageEnable (uint32_t beaconNodeId);
 bool NrSlBeaconCoverageIsEnabled (void);
@@ -34,8 +45,8 @@ void NrSlBeaconCoverageNotifyDecoded (uint32_t rxNodeId);
 
 struct NrSlBeaconCoverageSnapshot
 {
-  uint64_t seq {0};    //!< Sequence number of the most recent beacon transmission
-  uint32_t decoded {0}; //!< Distinct receiving node count that decoded that sequence
+  uint64_t seq {0};                    //!< Sequence number of the most recent beacon transmission
+  std::vector<uint32_t> decoderNodeIds; //!< Distinct receiving node ids that decoded that sequence (unfiltered — see class comment)
 };
 
 NrSlBeaconCoverageSnapshot NrSlBeaconCoverageGetSnapshot (void);

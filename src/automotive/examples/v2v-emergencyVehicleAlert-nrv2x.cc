@@ -37,6 +37,7 @@
 #include "ns3/log.h"
 #include "ns3/antenna-module.h"
 #include <iomanip>
+#include <unordered_set>
 #include <unistd.h>
 #include "ns3/sumo_xml_parser.h"
 #include "ns3/vehicle-visualizer-module.h"
@@ -921,14 +922,33 @@ main (int argc, char *argv[])
     {
       NrSlBeaconCoverageEnable (static_cast<uint32_t> (beaconNodeId));
 
-      sumoClient->SetPerTickCallback ([] (uint32_t liveVehicles)
+      sumoClient->SetPerTickCallback ([] (const std::vector<uint32_t>& liveVehicleNodeIds)
         {
           NrSlBeaconCoverageSnapshot snap = NrSlBeaconCoverageGetSnapshot ();
-          double frac = liveVehicles > 0 ? static_cast<double> (snap.decoded) / liveVehicles : 0.0;
+
+          // Decoders are node ids, not yet filtered to "currently live
+          // vehicle" (see nr-sl-beacon-coverage.h): the vehicle pool has
+          // up to numberOfNodes nodes with an active sidelink stack from
+          // t=0, but only a subset are claimed/live in m_NodeMap at any
+          // tick — an unclaimed or already-parked pool node can still
+          // physically decode a broadcast it's in range of. Intersect
+          // against the live set so decoded can never exceed live.
+          std::unordered_set<uint32_t> liveSet (liveVehicleNodeIds.begin (), liveVehicleNodeIds.end ());
+          uint32_t decodedAmongLive = 0;
+          for (uint32_t nodeId : snap.decoderNodeIds)
+            {
+              if (liveSet.count (nodeId) > 0)
+                {
+                  ++decodedAmongLive;
+                }
+            }
+
+          uint32_t liveCount = static_cast<uint32_t> (liveVehicleNodeIds.size ());
+          double frac = liveCount > 0 ? static_cast<double> (decodedAmongLive) / liveCount : 0.0;
           std::cerr << "[nr-beacon-coverage] t=" << Simulator::Now ().GetSeconds ()
                      << " seq=" << snap.seq
-                     << " decoded=" << snap.decoded
-                     << " live=" << liveVehicles
+                     << " decoded=" << decodedAmongLive
+                     << " live=" << liveCount
                      << " frac=" << frac
                      << std::endl;
         });

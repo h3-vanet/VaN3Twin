@@ -634,15 +634,15 @@ namespace ns3
         // includes not-yet-spawned/already-parked slots) node container.
         if (m_perTickCallback)
           {
-            uint32_t liveVehicles = 0;
+            std::vector<uint32_t> liveVehicleNodeIds;
             for (const auto &entry : m_NodeMap)
               {
                 if (entry.second.first == StationType_passengerCar)
                   {
-                    ++liveVehicles;
+                    liveVehicleNodeIds.push_back (entry.second.second->GetId ());
                   }
               }
-            m_perTickCallback (liveVehicles);
+            m_perTickCallback (liveVehicleNodeIds);
           }
 
         // schedule next event to simulate next time step in sumo
@@ -1159,7 +1159,7 @@ std::string TraciClient::GetStationId(Ptr<Node> node)
 }
 
 void
-TraciClient::SetPerTickCallback (std::function<void(uint32_t)> cb)
+TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&)> cb)
 {
   m_perTickCallback = cb;
 }
