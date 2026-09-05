@@ -38,6 +38,9 @@
 #include "ns3/antenna-module.h"
 #include <iomanip>
 #include <unordered_set>
+#include <algorithm>
+#include <cmath>
+#include <vector>
 #include <unistd.h>
 #include "ns3/sumo_xml_parser.h"
 #include "ns3/vehicle-visualizer-module.h"
@@ -152,6 +155,26 @@ main (int argc, char *argv[])
   // explicitly set, it defaults to the probe node's own id.
   bool enableBeacon = false;
   int64_t beaconNodeId = -1;
+
+  // Generic RSU nodes (--rsu-count, off by default: 0 nodes), for a later
+  // centralized-broker arm. DECISION: kept as a mechanism separate from
+  // --beacon above, not "beacon is rsu-count==1" — they are conceptually
+  // distinct:
+  //   - --beacon is specifically the coverage-probe transmitter: it drives
+  //     ScheduleSlBeaconTx() (1 Hz TX) and is the node NrSlBeaconCoverage
+  //     tracks via --beacon-node-id. That semantics doesn't belong on a
+  //     generic RSU.
+  //   - --rsu-count nodes carry no beacon-transmission or coverage-counter
+  //     semantics of their own; they are just addressable NR-V2X sidelink
+  //     endpoints for a later task (the Zenoh bridge) to drive individually.
+  //   - Keeping --beacon's existing code path completely untouched removes
+  //     any risk of changing its behavior (including RNG-stream numbering)
+  //     for the already-completed experimental runs that used it, which
+  //     unifying the two mechanisms behind one code path would risk.
+  // Both still reuse the same already-configured nrHelper/nrSlHelper/
+  // allBwps/bwpIdContainer/slPreConfigNr/internet/ipv4RoutingHelper, the
+  // same way --beacon does -- "same stack", not "same node".
+  uint32_t rsuCount = 0;
 
   xmlDocPtr rou_xml_file;
   double m_baseline_prr = 150.0;
@@ -295,6 +318,12 @@ main (int argc, char *argv[])
                 "--beacon is also given and this is left unset, it "
                 "defaults to the probe node's own id",
                 beaconNodeId);
+  cmd.AddValue ("rsu-count",
+                "Number of generic non-vehicle sidelink RSU nodes to create "
+                "(off by default: 0). Distributed over the SUMO map's "
+                "bounding box on a uniform grid. Separate mechanism from "
+                "--beacon -- see the rsuCount declaration for why.",
+                rsuCount);
 
 
   // Parse the command line
@@ -648,6 +677,20 @@ main (int argc, char *argv[])
   Ptr<Node> beaconNode;
   Ptr<Socket> beaconSocket;
 
+  // Generic RSU nodes (TASK "interface shape", off by default: rsuCount==0):
+  // constructed later in their own block, separate from the beacon's above.
+  // rsuNodeContainer/rsuNetDeviceContainer/rsuSockets are the addressable
+  // interface a later task uses to drive a specific RSU: node i's ns-3 Node
+  // is rsuNodeContainer.Get(i), its NR-V2X NetDevice is
+  // rsuNetDeviceContainer.Get(i), and its already-bound UDP socket (same
+  // group/port as the vehicles and the beacon) is rsuSockets[i] -- e.g.
+  // rsuSockets[i]->SendTo(pkt, 0, InetSocketAddress(groupAddress4, port))
+  // transmits from RSU i specifically. All three are sized rsuCount and
+  // indexed identically, once the construction block below has run.
+  NodeContainer rsuNodeContainer;
+  NetDeviceContainer rsuNetDeviceContainer;
+  std::vector<Ptr<Socket>> rsuSockets;
+
   /*
    * if enableOneTxPerLane is true:
    *
@@ -768,6 +811,66 @@ main (int argc, char *argv[])
       beaconSocket = Socket::CreateSocket (beaconNode, UdpSocketFactory::GetTypeId ());
       beaconSocket->SetAllowBroadcast (true);
       beaconSocket->Bind (InetSocketAddress (Ipv4Address::GetAny (), port));
+    }
+
+  /*
+   * Generic RSU nodes (--rsu-count, off by default: 0 nodes). Same
+   * construction-order rule as the beacon block above and for the same
+   * reason: placed here, strictly after all vehicle- and beacon-related
+   * construction, so that a run with the default rsuCount==0 creates zero
+   * additional nodes and consumes zero additional RNG draws -- provably
+   * identical to a build that never had --rsu-count at all, regardless of
+   * whether --beacon is also passed.
+   *
+   * Mirrors the beacon block's sequence (device install, sidelink prep,
+   * pre-configuration, AssignStreams, IP stack, bearer activation, socket)
+   * applied to rsuCount nodes at once via nrHelper/nrSlHelper's
+   * container-based APIs, rather than duplicating per-node.
+   */
+  if (rsuCount > 0)
+    {
+      rsuNodeContainer.Create (rsuCount);
+      MobilityHelper rsuMobility;
+      rsuMobility.Install (rsuNodeContainer);
+
+      rsuNetDeviceContainer = nrHelper->InstallUeDevice (rsuNodeContainer, allBwps);
+      for (auto it = rsuNetDeviceContainer.Begin (); it != rsuNetDeviceContainer.End (); ++it)
+        {
+          DynamicCast<NrUeNetDevice> (*it)->UpdateConfig ();
+        }
+
+      nrSlHelper->PrepareUeForSidelink (rsuNetDeviceContainer, bwpIdContainer);
+      nrSlHelper->InstallNrSlPreConfiguration (rsuNetDeviceContainer, slPreConfigNr);
+
+      stream += nrHelper->AssignStreams (rsuNetDeviceContainer, stream);
+      stream += nrSlHelper->AssignStreams (rsuNetDeviceContainer, stream);
+
+      internet.Install (rsuNodeContainer);
+      epcHelper->AssignUeIpv4Address (rsuNetDeviceContainer);
+      for (uint32_t r = 0; r < rsuNodeContainer.GetN (); ++r)
+        {
+          Ptr<Ipv4StaticRouting> rsuStaticRouting = ipv4RoutingHelper.GetStaticRouting (rsuNodeContainer.Get (r)->GetObject<Ipv4> ());
+          rsuStaticRouting->SetDefaultRoute (epcHelper->GetUeDefaultGatewayAddress (), 1);
+        }
+
+      // Same group/dstL2Id as the vehicles and the beacon: both TX and RX
+      // activated for stack symmetry, same as the beacon's bearer above.
+      Ptr<LteSlTft> rsuTftTx = Create<LteSlTft> (LteSlTft::Direction::TRANSMIT, LteSlTft::CommType::GroupCast, groupAddress4, dstL2Id);
+      nrSlHelper->ActivateNrSlBearer (slBearersActivationTime, rsuNetDeviceContainer, rsuTftTx);
+
+      Ptr<LteSlTft> rsuTftRx = Create<LteSlTft> (LteSlTft::Direction::RECEIVE, LteSlTft::CommType::GroupCast, groupAddress4, dstL2Id);
+      nrSlHelper->ActivateNrSlBearer (slBearersActivationTime, rsuNetDeviceContainer, rsuTftRx);
+
+      // One socket per RSU, bound the same way beaconSocket is, so a later
+      // task can transmit from RSU i via rsuSockets[i] independently of
+      // any other RSU.
+      rsuSockets.resize (rsuCount);
+      for (uint32_t r = 0; r < rsuCount; ++r)
+        {
+          rsuSockets[r] = Socket::CreateSocket (rsuNodeContainer.Get (r), UdpSocketFactory::GetTypeId ());
+          rsuSockets[r]->SetAllowBroadcast (true);
+          rsuSockets[r]->Bind (InetSocketAddress (Ipv4Address::GetAny (), port));
+        }
     }
 
   // enable log component
@@ -907,6 +1010,53 @@ main (int argc, char *argv[])
                 << " @1Hz => ~" << beaconWireBytesPerBeacon << " B/s"
                 << " (IPv4+UDP headers included; SL MAC/PHY framing not included)"
                 << std::endl;
+    }
+
+  /*
+   * RSU placement (--rsu-count): once sumoClient exists (same point in
+   * setup as the beacon's placement above), distribute the rsuCount nodes
+   * over the SUMO network's bounding box (TraCI's getNetBoundary(), a live
+   * value, same source the beacon uses for the map center) on a uniform
+   * grid: cols = ceil(sqrt(N)), rows = ceil(N/cols), one node per grid
+   * cell placed at the cell's center. A 2-D grid was chosen over spacing
+   * nodes along a single line because the eventual broker use case needs
+   * area coverage sampled across the whole map, not along one axis; a
+   * grid is also the simplest deterministic (no RNG draws) scheme that
+   * scales to arbitrary N without clustering nodes at the center the way
+   * e.g. concentric rings would for small N.
+   */
+  if (rsuCount > 0)
+    {
+      libsumo::TraCIPositionVector rsuNetBoundary = sumoClient->simulation.getNetBoundary ();
+      double minX = std::min (rsuNetBoundary[0].x, rsuNetBoundary[1].x);
+      double maxX = std::max (rsuNetBoundary[0].x, rsuNetBoundary[1].x);
+      double minY = std::min (rsuNetBoundary[0].y, rsuNetBoundary[1].y);
+      double maxY = std::max (rsuNetBoundary[0].y, rsuNetBoundary[1].y);
+      double width = maxX - minX;
+      double height = maxY - minY;
+
+      uint32_t cols = static_cast<uint32_t> (std::ceil (std::sqrt (static_cast<double> (rsuCount))));
+      uint32_t rows = static_cast<uint32_t> (std::ceil (static_cast<double> (rsuCount) / cols));
+
+      DoubleValue rsuAltitudeValue;
+      sumoClient->GetAttribute ("Altitude", rsuAltitudeValue);
+
+      for (uint32_t r = 0; r < rsuCount; ++r)
+        {
+          uint32_t gridRow = r / cols;
+          uint32_t gridCol = r % cols;
+          double rsuX = minX + (gridCol + 0.5) * (width / cols);
+          double rsuY = minY + (gridRow + 0.5) * (height / rows);
+
+          sumoClient->AddStation ("rsu" + std::to_string (r), rsuX, rsuY, rsuAltitudeValue.Get (), rsuNodeContainer.Get (r));
+
+          libsumo::TraCIPosition rsuLonLat = sumoClient->simulation.convertXYtoLonLat (rsuX, rsuY);
+          std::cerr << "[nr-rsu] index=" << r
+                     << " node=" << rsuNodeContainer.Get (r)->GetId ()
+                     << " x=" << rsuX << " y=" << rsuY
+                     << " lon=" << rsuLonLat.x << " lat=" << rsuLonLat.y
+                     << std::endl;
+        }
     }
 
   /*
