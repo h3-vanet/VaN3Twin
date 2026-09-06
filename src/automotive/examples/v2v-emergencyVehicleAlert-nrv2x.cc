@@ -728,6 +728,15 @@ main (int argc, char *argv[])
   uint16_t port = 8000;
   Ptr<LteSlTft> tft;
 
+  // Matches V2xGossipApp's own "Port" attribute default (see
+  // v2x-gossip-app.cc), named explicitly here -- rather than left as an
+  // implicit default -- so RSU gossip dispatch (below) targets the exact
+  // port vehicles' GossipApp is bound to instead of relying on an
+  // un-named default staying in sync by accident. "port" above (8000) is
+  // a different, disjoint port used only by the coverage-probe beacon;
+  // it is not where any application on a vehicle node listens.
+  uint16_t gossipPort = 8001;
+
   Ipv4InterfaceContainer ueIpIface;
   ueIpIface = epcHelper->AssignUeIpv4Address (allSlUesNetDeviceContainer);
 
@@ -952,6 +961,7 @@ main (int argc, char *argv[])
       /* Install gossip relay application */
       V2xGossipAppHelper gossipHelper;
       gossipHelper.SetAttribute ("VehicleId", StringValue (vehicleID));
+      gossipHelper.SetAttribute ("Port", UintegerValue (gossipPort));
       ApplicationContainer GossipApp = gossipHelper.Install (includedNode);
       GossipApp.Start (Seconds (0.0));
       GossipApp.Stop (Seconds(simTime) - Simulator::Now () - Seconds (0.1));
@@ -1048,7 +1058,18 @@ main (int argc, char *argv[])
           double rsuX = minX + (gridCol + 0.5) * (width / cols);
           double rsuY = minY + (gridRow + 0.5) * (height / rows);
 
-          sumoClient->AddStation ("rsu" + std::to_string (r), rsuX, rsuY, rsuAltitudeValue.Get (), rsuNodeContainer.Get (r));
+          std::string rsuId = "rsu" + std::to_string (r);
+          sumoClient->AddStation (rsuId, rsuX, rsuY, rsuAltitudeValue.Get (), rsuNodeContainer.Get (r));
+
+          // Broker-over-sidelink dispatch (TASK 1): register this RSU's
+          // socket under the same key it was just placed at in m_NodeMap,
+          // in TraciClient's gossip dispatch map, so a broker envelope
+          // addressed (after nearest-RSU selection) to this id transmits
+          // from here. Targets gossipPort, not the local "port" (8000)
+          // this socket happens to be bound to -- UDP send destination is
+          // independent of the sender's own bound port, and gossipPort is
+          // where vehicles' V2xGossipApp actually listens.
+          sumoClient->RegisterRsuSend (rsuId, rsuSockets[r], groupAddress4, gossipPort);
 
           libsumo::TraCIPosition rsuLonLat = sumoClient->simulation.convertXYtoLonLat (rsuX, rsuY);
           std::cerr << "[nr-rsu] index=" << r
