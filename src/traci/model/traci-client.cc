@@ -30,6 +30,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+#include "ns3/packet.h"
+#include "ns3/inet-socket-address.h"
+
 #include "traci-client.h"
 #include "v2x-gossip-app.h"
 
@@ -764,7 +767,7 @@ namespace ns3
             double avgSpeedKmh = (speedCount > 0) ? (speedSumMs / speedCount) * 3.6 : 0.0;
             m_vehicle_visualizer->sendExperimentUpdate(
                 "normal",
-                (uint32_t)m_gossipSend.size(),  // density proxy: vehicles with gossip app
+                (uint32_t)(m_gossipSend.size() - m_rsuSumoIds.size()),  // density proxy: vehicles with gossip app (RSUs excluded, see m_rsuSumoIds)
                 1, 500,                          // neighbor_k, gossip_interval_ms (hardcoded)
                 0, 0, 0, 0, avgSpeedKmh,        // placeholders for Rust metrics; avgSpeedKmh from TraCI
                 Simulator::Now().GetSeconds()); // ns-3 simulation clock
@@ -1171,6 +1174,37 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
   }
 
   void
+  TraciClient::RegisterRsuSend(const std::string& rsuId, Ptr<Socket> socket,
+                                Ipv4Address groupAddr, uint16_t port)
+  {
+    // DECISION: shared m_gossipSend, not a parallel dispatch map. The
+    // existing lookup in ProcessGossipIn (m_gossipSend.find(sumo_id)) is
+    // the dispatch code the task requires to resolve "rsu0".."rsuN-1"
+    // with NO changes -- that is only possible if RSU send-callbacks live
+    // in the exact map that lookup already checks. A parallel map would
+    // require touching the lookup itself to check both maps.
+    //
+    // Consequence: the per-sumo_id TX/RX counters and [gossip-summary-tx]
+    // logging in ProcessGossipIn are ALSO keyed by this same string space,
+    // so an RSU's traffic will appear there under "rsu0" etc. This is left
+    // as is (not split into parallel counters) because those counters are
+    // already only ever printed as a labeled log line, and are already
+    // namespaced by the "rsu" prefix -- exactly the convention this
+    // codebase already relies on to distinguish sender_id's inverted
+    // meaning for broker envelopes. The one place this WOULD silently
+    // corrupt a number rather than just a label is the scalar
+    // "m_gossipSend.size()" used in UpdatePositions as a "vehicles with
+    // gossip app" density proxy -- that call site is adjusted (see
+    // m_rsuSumoIds) to subtract RSU entries so it keeps meaning what its
+    // name says.
+    m_gossipSend[rsuId] = [socket, groupAddr, port] (const uint8_t* data, uint32_t len) {
+        Ptr<Packet> pkt = Create<Packet> (data, len);
+        socket->SendTo (pkt, 0, InetSocketAddress (groupAddr, port));
+      };
+    m_rsuSumoIds.insert (rsuId);
+  }
+
+  void
   TraciClient::RegisterGossipApp(const std::string& vehicleId, Ptr<Application> appBase)
   {
     Ptr<V2xGossipApp> app = appBase->GetObject<V2xGossipApp>();
@@ -1222,36 +1256,131 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
 
         if (sumo_id.empty()) continue;
 
-        // Keep mapping current
-        if (sender_id != 0)
-          m_sumo_to_u64[sumo_id] = sender_id;
+        // Broker envelopes (the Rust bridge's per-vehicle event topic) use
+        // an "rsu"-prefixed sumo_id and give sender_id the OPPOSITE meaning
+        // it has for peer gossip: the numeric id of the DESTINATION
+        // vehicle the broker wants reached, not an origin. Detected once,
+        // since it changes how sender_id must be treated below.
+        bool is_broker_envelope = (sumo_id.rfind ("rsu", 0) == 0);
 
-        auto it = m_gossipSend.find(sumo_id);
+        // dispatch_id is what actually gets looked up in m_gossipSend and
+        // what the TX counters/logging below are keyed by. For ordinary
+        // gossip it is just sumo_id, unchanged. For a broker envelope it
+        // is resolved below to the RSU nearest the destination vehicle --
+        // selection applies ONLY in this branch, so vehicle-originated
+        // gossip is bit-identical to before this change.
+        std::string dispatch_id = sumo_id;
+
+        if (is_broker_envelope)
+          {
+            // Resolve the destination vehicle's current sumo id from its
+            // numeric id by scanning m_sumo_to_u64 (no inverse map is kept
+            // alongside it: every site that writes or erases
+            // m_sumo_to_u64 would then have to keep a second map in sync,
+            // and a stale/duplicate entry there would silently misroute a
+            // broker envelope to the wrong vehicle -- worse than the
+            // O(#vehicles) scan this costs, which is only paid for broker
+            // traffic, not every gossip message, and is cheap at this
+            // scale).
+            std::string dest_sumo_id;
+            for (const auto &kv : m_sumo_to_u64)
+              {
+                if (kv.second == sender_id)
+                  {
+                    dest_sumo_id = kv.first;
+                    break;
+                  }
+              }
+
+            if (dest_sumo_id.empty())
+              {
+                // Destination never registered (Rust never called
+                // RegisterVehicleId for this id) or already exited (its
+                // m_sumo_to_u64 entry is erased on departure, same as
+                // m_NodeMap's). Nothing to compute "nearest" against, so
+                // drop here with a specific reason rather than falling
+                // through to the generic "no GossipApp" message below,
+                // which would otherwise blame a placeholder RSU id
+                // instead of the real cause.
+                std::cout << "[gossip-in] DROP: broker envelope, unknown/exited destination sender_id="
+                          << sender_id << std::endl;
+                continue;
+              }
+
+            auto destNodeIt = m_NodeMap.find (dest_sumo_id);
+            if (destNodeIt == m_NodeMap.end ())
+              {
+                // Defensive only: m_sumo_to_u64 and m_NodeMap are erased
+                // together on departure (see SynchroniseNodeMap), so this
+                // should not happen in practice.
+                std::cout << "[gossip-in] DROP: broker envelope, destination sumo_id=" << dest_sumo_id
+                          << " has no node in m_NodeMap" << std::endl;
+                continue;
+              }
+            Vector dest_pos = destNodeIt->second.second->GetObject<MobilityModel> ()->GetPosition ();
+
+            bool have_nearest = false;
+            double nearest_dist = 0.0;
+            std::string nearest_rsu_id;
+            for (const auto &kv : m_NodeMap)
+              {
+                if (kv.second.first != StationType_roadSideUnit) continue;
+                Vector rsu_pos = kv.second.second->GetObject<MobilityModel> ()->GetPosition ();
+                double dist = CalculateDistance (dest_pos, rsu_pos);
+                if (!have_nearest || dist < nearest_dist)
+                  {
+                    have_nearest = true;
+                    nearest_dist = dist;
+                    nearest_rsu_id = kv.first;
+                  }
+              }
+
+            if (have_nearest)
+              {
+                dispatch_id = nearest_rsu_id;
+              }
+            // else: no RSU nodes exist at all (--rsu-count=0). Leave
+            // dispatch_id as the broker's placeholder id -- no send
+            // callback is registered under that key either, so this falls
+            // through to the existing "no GossipApp" DROP below with an
+            // accurate message.
+          }
+        else if (sender_id != 0)
+          {
+            // Keep mapping current (peer gossip only). Must NOT run for
+            // broker envelopes: there, sender_id names the destination
+            // vehicle, not sumo_id's own origin, and writing it here would
+            // corrupt m_sumo_to_u64 with a bogus "rsuN -> some vehicle's
+            // id" entry -- which the nearest-RSU resolution above scans.
+            m_sumo_to_u64[sumo_id] = sender_id;
+          }
+
+        auto it = m_gossipSend.find(dispatch_id);
         if (it == m_gossipSend.end())
           {
-            std::cout << "[gossip-in] DROP: no GossipApp for sumo_id=" << sumo_id << std::endl;
+            std::cout << "[gossip-in] DROP: no GossipApp for sumo_id=" << dispatch_id << std::endl;
             continue;
           }
 
         // Forward the full envelope bytes — V2xGossipApp broadcasts them via NR-V2X
         it->second(buf, static_cast<uint32_t>(rc));
-        m_gossipTxCount[sumo_id]++;
-        m_gossipTxLog[sumo_id]++;
-        m_gossipTxTotal[sumo_id]++;
+        m_gossipTxCount[dispatch_id]++;
+        m_gossipTxLog[dispatch_id]++;
+        m_gossipTxTotal[dispatch_id]++;
         {
           double now = Simulator::Now().GetSeconds();
-          bool time_trigger = (now - m_gossipLastLogTime[sumo_id]) >= 30.0;
-          if (m_gossipTxLog[sumo_id] % 100 == 0 || time_trigger)
+          bool time_trigger = (now - m_gossipLastLogTime[dispatch_id]) >= 30.0;
+          if (m_gossipTxLog[dispatch_id] % 100 == 0 || time_trigger)
             {
               char logbuf[256];
               std::snprintf(logbuf, sizeof(logbuf),
                   "[gossip-summary-tx] sumo_id=%s total_tx=%u total_rx=%u neighbors=%zu",
-                  sumo_id.c_str(), m_gossipTxTotal[sumo_id],
-                  m_gossipRxTotal.count(sumo_id) ? m_gossipRxTotal.at(sumo_id) : 0,
-                  m_gossipNeighbors.count(sumo_id) ? m_gossipNeighbors.at(sumo_id).size() : 0);
+                  dispatch_id.c_str(), m_gossipTxTotal[dispatch_id],
+                  m_gossipRxTotal.count(dispatch_id) ? m_gossipRxTotal.at(dispatch_id) : 0,
+                  m_gossipNeighbors.count(dispatch_id) ? m_gossipNeighbors.at(dispatch_id).size() : 0);
               GossipLog(logbuf);
-              m_gossipTxLog[sumo_id] = 0;
-              m_gossipLastLogTime[sumo_id] = now;
+              m_gossipTxLog[dispatch_id] = 0;
+              m_gossipLastLogTime[dispatch_id] = now;
             }
         }
       }
@@ -1300,27 +1429,54 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
         payload = envelope;
       }
 
+    // Extract the origin sumo_id from the received envelope (data holds
+    // the full broadcast bytes, unmodified by the TX-side nearest-RSU
+    // selection: that only picks which socket transmits, not what the
+    // envelope's own sumo_id field says). Used below both for neighbor
+    // tracking (as before) and to tell an RSU/broker-originated delivery
+    // apart from ordinary peer gossip on the return leg.
+    std::string originSumoId;
+    {
+      std::string env(reinterpret_cast<const char*>(data), len);
+      std::string search = "\"sumo_id\":\"";
+      size_t p2 = env.find(search);
+      if (p2 != std::string::npos)
+        {
+          p2 += search.size();
+          size_t e = env.find('"', p2);
+          if (e != std::string::npos)
+            originSumoId = env.substr(p2, e - p2);
+        }
+    }
+    bool isBrokerDelivery = (originSumoId.rfind ("rsu", 0) == 0);
+
     // Build outbound message: {"receiver_id":<u64>,"payload":<GossipMessage JSON>}
-    std::string out = "{\"receiver_id\":" + std::to_string(receiver_id)
-                    + ",\"payload\":" + payload + "}";
+    // RETURN-LEG CONCLUSION: for ordinary peer gossip, receiver_id+payload
+    // is unchanged and sufficient -- routing only ever depended on WHO
+    // received it. Once RSU/broker deliveries ride this same path, the
+    // Rust side may also need to know a delivery came from the broker
+    // (e.g. to publish to a different Zenoh topic than peer gossip), and
+    // that information -- the origin's "rsu"-prefixed sumo_id -- is only
+    // available here, before it is discarded; the payload itself carries
+    // no origin marker. So: add "origin_sumo_id", but ONLY when the origin
+    // is an RSU, and as an additive key (never replacing/renaming an
+    // existing one). Ordinary gossip returns stay byte-for-byte identical
+    // to before this change; only the new broker-delivery traffic gains
+    // the extra field, and any consumer that only reads receiver_id/
+    // payload is unaffected either way.
+    std::string out = "{\"receiver_id\":" + std::to_string(receiver_id);
+    if (isBrokerDelivery)
+      {
+        out += ",\"origin_sumo_id\":\"" + originSumoId + "\"";
+      }
+    out += ",\"payload\":" + payload + "}";
 
     // Track RX count and unique neighbors for visualizer metrics
     m_gossipRxCount[receiverSumoId]++;
     m_gossipRxLog[receiverSumoId]++;
     m_gossipRxTotal[receiverSumoId]++;
-    // Extract sender sumo_id from the envelope (data contains the full broadcast envelope)
-    {
-      std::string env(reinterpret_cast<const char*>(data), len);
-      std::string search = "\"sumo_id\":\"";
-      size_t p = env.find(search);
-      if (p != std::string::npos)
-        {
-          p += search.size();
-          size_t e = env.find('"', p);
-          if (e != std::string::npos)
-            m_gossipNeighbors[receiverSumoId].insert(env.substr(p, e - p));
-        }
-    }
+    if (!originSumoId.empty())
+      m_gossipNeighbors[receiverSumoId].insert(originSumoId);
     {
       double now = Simulator::Now().GetSeconds();
       bool time_trigger = (now - m_gossipLastLogTime[receiverSumoId]) >= 30.0;

@@ -46,6 +46,8 @@
 #include "sumo-TraCIAPI.h"
 #include "sumo-TraCIDefs.h"
 
+#include "ns3/socket.h"
+#include "ns3/ipv4-address.h"
 #include "ns3/vehicle-visualizer.h"
 
 #include "ns3/StationType.h"
@@ -99,6 +101,15 @@ public:
 
   void RegisterGossipApp(const std::string& vehicleId, Ptr<Application> app);
   void RegisterVehicleId(const std::string& sumoId, uint64_t rustId);
+
+  // Register an RSU's raw UDP socket as a gossip-dispatch target under
+  // rsuId (e.g. "rsu0"), in the SAME m_gossipSend map the vehicles'
+  // GossipApp callbacks live in -- see the RegisterRsuSend definition for
+  // why it is shared rather than a parallel map. groupAddr/port must match
+  // where the vehicles' V2xGossipApp is bound, or an RSU-originated
+  // envelope will reach the sidelink but find no application listening.
+  void RegisterRsuSend(const std::string& rsuId, Ptr<Socket> socket,
+                       Ipv4Address groupAddr, uint16_t port);
 
   std::vector<std::string> getVehicleNodeMapIds(); // get all vehicle node ids
 
@@ -195,6 +206,13 @@ private:
   // Store Send callbacks as std::function to avoid pulling V2xGossipApp type into this header
   std::unordered_map<std::string, std::function<void(const uint8_t*, uint32_t)>> m_gossipSend;
   std::unordered_map<std::string, uint64_t>           m_sumo_to_u64;
+
+  // Which m_gossipSend keys are RSUs, not vehicles -- see RegisterRsuSend.
+  // Used only to keep aggregate, scalar stats (e.g. the "vehicles with
+  // gossip app" density proxy) from counting RSUs as vehicles; per-key
+  // counters/logs are left keyed by sumo_id as before, already
+  // distinguishable by the "rsu" prefix.
+  std::unordered_set<std::string>                     m_rsuSumoIds;
 
   // Per-vehicle gossip metrics for visualizer (color coding, delivery ratio, neighbor count)
   std::unordered_map<std::string, uint32_t>              m_gossipTxCount;
