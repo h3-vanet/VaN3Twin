@@ -29,6 +29,7 @@ set(source_files
     model/nr-ue-phy.cc
     model/nr-spectrum-phy.cc
     model/nr-sl-beacon-coverage.cc
+    model/nr-sl-rsu-coverage.cc
     model/nr-interference.cc
     model/nr-mac-scheduler.cc
     model/nr-mac-scheduler-tdma-rr.cc
@@ -152,6 +153,7 @@ set(header_files
     model/nr-ue-phy.h
     model/nr-spectrum-phy.h
     model/nr-sl-beacon-coverage.h
+    model/nr-sl-rsu-coverage.h
     model/nr-interference.h
     model/nr-mac-pdu-info.h
     model/nr-mac-header-vs.h

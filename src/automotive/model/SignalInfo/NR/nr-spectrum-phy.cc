@@ -35,6 +35,7 @@
 #include "nr-sl-sci-f1a-header.h"
 #include "nr-sl-sci-f2a-header.h"
 #include "nr-sl-beacon-coverage.h"
+#include "nr-sl-rsu-coverage.h"
 #include "ns3/sinr-tag.h"
 #include "ns3/timestamp-tag.h"
 #include "ns3/rsrp-tag.h"
@@ -2514,6 +2515,22 @@ NrSpectrumPhy::RxSlPssch (std::vector<uint32_t> paramIndexes)
                    == NrSlBeaconCoverageGetBeaconNodeId ())
             {
               NrSlBeaconCoverageNotifyDecoded (GetDevice ()->GetNode ()->GetId ());
+            }
+
+          // RSU coverage hook (nr-sl-rsu-coverage.h): a separate mechanism
+          // from the beacon hook above -- same data already in scope
+          // (tx node id from the stamped signal parameters, rx node id
+          // from this PHY's own device), just checked against a set of
+          // RSU node ids instead of a single beacon node id. No-op unless
+          // NrSlRsuCoverageEnable() was called (only when --rsu-count > 0),
+          // so this is dead weight (one bool check) for every other run.
+          if (!tbIt.second.isDataCorrupted && NrSlRsuCoverageIsEnabled ())
+            {
+              uint32_t txNodeId = m_slRxSigParamInfo.at (tbIt.second.pktIndex).params->nodeId;
+              if (NrSlRsuCoverageIsRsuNodeId (txNodeId))
+                {
+                  NrSlRsuCoverageNotifyDecoded (txNodeId, GetDevice ()->GetNode ()->GetId ());
+                }
             }
         }
       m_rxPsschTraceUe (traceParams);

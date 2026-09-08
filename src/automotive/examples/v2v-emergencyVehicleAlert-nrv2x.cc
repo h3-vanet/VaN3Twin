@@ -31,12 +31,14 @@
 #include "ns3/point-to-point-module.h"
 #include "ns3/nr-module.h"
 #include "ns3/nr-sl-beacon-coverage.h"
+#include "ns3/nr-sl-rsu-coverage.h"
 #include "ns3/lte-module.h"
 #include "ns3/stats-module.h"
 #include "ns3/config-store-module.h"
 #include "ns3/log.h"
 #include "ns3/antenna-module.h"
 #include <iomanip>
+#include <fstream>
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
@@ -120,6 +122,34 @@ ScheduleSlBeaconTx (Ptr<Socket> socket, Ipv4Address groupAddr, uint16_t port, ui
 }
 
 
+/**
+ * \brief Default path for the per-run RSU decode-coverage CSV (see the
+ *        "OUTPUT" block in main()).
+ *
+ * Unlike defaultLogFileName() (tee-streambuf.h), which is day-granularity
+ * and shared/appended-to by every run started that day under the same
+ * --log-prefix, this adds seconds-precision and the process's own PID so
+ * two runs started on the same day -- even the same second, from two
+ * different processes -- never write to the same file.
+ */
+std::string
+DefaultRsuCoverageLogPath (const std::string &prefix)
+{
+  std::time_t t = std::time (nullptr);
+  std::tm *tm = std::localtime (&t);
+  std::ostringstream oss;
+  oss << prefix << "-rsu-coverage."
+      << (tm->tm_year + 1900)
+      << (tm->tm_mon + 1 < 10 ? "0" : "") << (tm->tm_mon + 1)
+      << (tm->tm_mday < 10 ? "0" : "") << tm->tm_mday << "-"
+      << (tm->tm_hour < 10 ? "0" : "") << tm->tm_hour
+      << (tm->tm_min < 10 ? "0" : "") << tm->tm_min
+      << (tm->tm_sec < 10 ? "0" : "") << tm->tm_sec
+      << "." << getpid ()
+      << ".csv";
+  return oss.str ();
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -164,9 +194,14 @@ main (int argc, char *argv[])
   //     ScheduleSlBeaconTx() (1 Hz TX) and is the node NrSlBeaconCoverage
   //     tracks via --beacon-node-id. That semantics doesn't belong on a
   //     generic RSU.
-  //   - --rsu-count nodes carry no beacon-transmission or coverage-counter
-  //     semantics of their own; they are just addressable NR-V2X sidelink
-  //     endpoints for a later task (the Zenoh bridge) to drive individually.
+  //   - --rsu-count nodes carry no beacon-transmission semantics of their
+  //     own; they are addressable NR-V2X sidelink endpoints the Zenoh
+  //     bridge drives individually (broker-over-sidelink dispatch, see
+  //     TraciClient::RegisterRsuSend). They do have their own
+  //     decode-coverage counter (nr-sl-rsu-coverage.h, see the "OUTPUT"
+  //     block below) -- a separate mechanism from NrSlBeaconCoverage for
+  //     the same reason as everything else here: RSU tx is event-driven,
+  //     not a periodic 1 Hz "logical beacon" send.
   //   - Keeping --beacon's existing code path completely untouched removes
   //     any risk of changing its behavior (including RNG-stream numbering)
   //     for the already-completed experimental runs that used it, which
@@ -175,6 +210,9 @@ main (int argc, char *argv[])
   // allBwps/bwpIdContainer/slPreConfigNr/internet/ipv4RoutingHelper, the
   // same way --beacon does -- "same stack", not "same node".
   uint32_t rsuCount = 0;
+  // Per-run RSU coverage CSV path. Empty (the default) means "derive one
+  // from log_prefix + PID + timestamp" -- see DefaultRsuCoverageLogPath().
+  std::string rsuCoverageLogPath;
 
   xmlDocPtr rou_xml_file;
   double m_baseline_prr = 150.0;
@@ -324,6 +362,13 @@ main (int argc, char *argv[])
                 "bounding box on a uniform grid. Separate mechanism from "
                 "--beacon -- see the rsuCount declaration for why.",
                 rsuCount);
+  cmd.AddValue ("rsu-coverage-log",
+                "Per-run CSV file for RSU decode-coverage output (only "
+                "used when --rsu-count > 0). Default: derived from "
+                "--log-prefix plus this process's PID and start time, so "
+                "concurrent same-day runs each get their own file instead "
+                "of interleaving in the shared rolling log.",
+                rsuCoverageLogPath);
 
 
   // Parse the command line
@@ -1069,7 +1114,15 @@ main (int argc, char *argv[])
           // this socket happens to be bound to -- UDP send destination is
           // independent of the sender's own bound port, and gossipPort is
           // where vehicles' V2xGossipApp actually listens.
-          sumoClient->RegisterRsuSend (rsuId, rsuSockets[r], groupAddress4, gossipPort);
+          //
+          // The onSend callback notifies the RSU-coverage module
+          // (nr-sl-rsu-coverage.h) of a transmit attempt, keyed by this
+          // RSU's ns-3 Node ID. It is a no-op when RSU coverage isn't
+          // enabled (rsuCount==0 never reaches here at all; see below for
+          // why it's still enabled unconditionally whenever rsuCount>0).
+          uint32_t rsuNodeId = rsuNodeContainer.Get (r)->GetId ();
+          sumoClient->RegisterRsuSend (rsuId, rsuSockets[r], groupAddress4, gossipPort,
+                                        [rsuNodeId] () { NrSlRsuCoverageNotifyTx (rsuNodeId); });
 
           libsumo::TraCIPosition rsuLonLat = sumoClient->simulation.convertXYtoLonLat (rsuX, rsuY);
           std::cerr << "[nr-rsu] index=" << r
@@ -1092,36 +1145,157 @@ main (int argc, char *argv[])
   if (beaconNodeId >= 0)
     {
       NrSlBeaconCoverageEnable (static_cast<uint32_t> (beaconNodeId));
+    }
 
-      sumoClient->SetPerTickCallback ([] (const std::vector<uint32_t>& liveVehicleNodeIds)
+  /*
+   * RSU decode-coverage counter/emitter (separate mechanism, see
+   * nr-sl-rsu-coverage.h for why it is not folded into NrSlBeaconCoverage
+   * above). Enabled whenever rsuCount>0, independent of --beacon /
+   * --beacon-node-id -- the two features can run simultaneously (an RSU
+   * fleet AND a coverage-probe beacon in the same run) or separately.
+   * Registers every RSU's ns-3 Node ID up front so the PHY-side hook
+   * (nr-spectrum-phy.cc) has a fixed set to check RSU-vs-vehicle against
+   * for the whole run.
+   */
+  bool rsuCoverageEnabled = (rsuCount > 0);
+  std::ofstream rsuCoverageOfs;
+  // Node-id -> "rsuN" label, so CSV rows read using the same index the
+  // placement log ([nr-rsu]) and gossip dispatch keys ("rsu0".."rsuN-1")
+  // already use, instead of a bare ns-3 Node ID a reader would have to
+  // cross-reference against the [nr-rsu] log to make sense of.
+  std::unordered_map<uint32_t, uint32_t> rsuCoverageNodeIdToIndex;
+  if (rsuCoverageEnabled)
+    {
+      std::vector<uint32_t> rsuCoverageNodeIds;
+      for (uint32_t r = 0; r < rsuCount; ++r)
         {
-          NrSlBeaconCoverageSnapshot snap = NrSlBeaconCoverageGetSnapshot ();
+          uint32_t nodeId = rsuNodeContainer.Get (r)->GetId ();
+          rsuCoverageNodeIds.push_back (nodeId);
+          rsuCoverageNodeIdToIndex[nodeId] = r;
+        }
+      NrSlRsuCoverageEnable (rsuCoverageNodeIds);
 
-          // Decoders are node ids, not yet filtered to "currently live
-          // vehicle" (see nr-sl-beacon-coverage.h): the vehicle pool has
-          // up to numberOfNodes nodes with an active sidelink stack from
-          // t=0, but only a subset are claimed/live in m_NodeMap at any
-          // tick — an unclaimed or already-parked pool node can still
-          // physically decode a broadcast it's in range of. Intersect
-          // against the live set so decoded can never exceed live.
+      // OUTPUT: a per-run file, not the rolling day-granularity log
+      // (log_prefix + TeeStreamBuf above) two same-day runs already share
+      // and interleave in. rsu-coverage-log lets a caller pin an explicit
+      // path; left empty (the default), one is derived from log_prefix +
+      // this process's own PID + a seconds-precision timestamp, which is
+      // unique per run the same way log_prefix's day-only default is not.
+      if (rsuCoverageLogPath.empty ())
+        {
+          rsuCoverageLogPath = DefaultRsuCoverageLogPath (log_prefix);
+        }
+      rsuCoverageOfs.open (rsuCoverageLogPath, std::ofstream::trunc);
+      if (rsuCoverageOfs.is_open ())
+        {
+          rsuCoverageOfs << "t,rsu_id,denominator,tx,covered,frac,addressed" << std::endl;
+        }
+      else
+        {
+          std::cerr << "[nr-rsu-coverage] WARNING: could not open " << rsuCoverageLogPath << std::endl;
+        }
+      std::cerr << "[nr-rsu-coverage] logging to " << rsuCoverageLogPath << std::endl;
+    }
+
+  if (beaconNodeId >= 0 || rsuCoverageEnabled)
+    {
+      sumoClient->SetPerTickCallback ([rsuCoverageEnabled, &rsuCoverageOfs, &rsuCoverageNodeIdToIndex]
+        (const std::vector<uint32_t>& liveVehicleNodeIds)
+        {
           std::unordered_set<uint32_t> liveSet (liveVehicleNodeIds.begin (), liveVehicleNodeIds.end ());
-          uint32_t decodedAmongLive = 0;
-          for (uint32_t nodeId : snap.decoderNodeIds)
+          uint32_t liveCount = static_cast<uint32_t> (liveVehicleNodeIds.size ());
+
+          if (NrSlBeaconCoverageIsEnabled ())
             {
-              if (liveSet.count (nodeId) > 0)
+              NrSlBeaconCoverageSnapshot snap = NrSlBeaconCoverageGetSnapshot ();
+
+              // Decoders are node ids, not yet filtered to "currently live
+              // vehicle" (see nr-sl-beacon-coverage.h): the vehicle pool has
+              // up to numberOfNodes nodes with an active sidelink stack from
+              // t=0, but only a subset are claimed/live in m_NodeMap at any
+              // tick — an unclaimed or already-parked pool node can still
+              // physically decode a broadcast it's in range of. Intersect
+              // against the live set so decoded can never exceed live.
+              uint32_t decodedAmongLive = 0;
+              for (uint32_t nodeId : snap.decoderNodeIds)
                 {
-                  ++decodedAmongLive;
+                  if (liveSet.count (nodeId) > 0)
+                    {
+                      ++decodedAmongLive;
+                    }
                 }
+
+              double frac = liveCount > 0 ? static_cast<double> (decodedAmongLive) / liveCount : 0.0;
+              std::cerr << "[nr-beacon-coverage] t=" << Simulator::Now ().GetSeconds ()
+                         << " seq=" << snap.seq
+                         << " decoded=" << decodedAmongLive
+                         << " live=" << liveCount
+                         << " frac=" << frac
+                         << std::endl;
             }
 
-          uint32_t liveCount = static_cast<uint32_t> (liveVehicleNodeIds.size ());
-          double frac = liveCount > 0 ? static_cast<double> (decodedAmongLive) / liveCount : 0.0;
-          std::cerr << "[nr-beacon-coverage] t=" << Simulator::Now ().GetSeconds ()
-                     << " seq=" << snap.seq
-                     << " decoded=" << decodedAmongLive
-                     << " live=" << liveCount
-                     << " frac=" << frac
-                     << std::endl;
+          if (rsuCoverageEnabled)
+            {
+              // Window = since the last tick this callback fired (or since
+              // Enable(), for the first tick) -- see
+              // NrSlRsuCoverageGetSnapshotAndReset() and the "covered vs.
+              // not addressed" note in nr-sl-rsu-coverage.h. Also
+              // unfiltered-to-live for the same physical reason as the
+              // beacon path above (an unclaimed/parked pool node can still
+              // decode), so every decoder set below is intersected with
+              // liveSet exactly like decodedAmongLive is.
+              NrSlRsuCoverageSnapshot snap = NrSlRsuCoverageGetSnapshotAndReset ();
+              double t = Simulator::Now ().GetSeconds ();
+
+              uint32_t totalTx = 0;
+              std::unordered_set<uint32_t> unionDecodedLive;
+              for (const auto & pr : snap.perRsu)
+                {
+                  totalTx += pr.txCount;
+                  uint32_t coveredLive = 0;
+                  for (uint32_t nodeId : pr.decoderNodeIds)
+                    {
+                      if (liveSet.count (nodeId) > 0)
+                        {
+                          ++coveredLive;
+                          unionDecodedLive.insert (nodeId);
+                        }
+                    }
+                  bool addressed = pr.txCount > 0;
+                  if (rsuCoverageOfs.is_open ())
+                    {
+                      auto idxIt = rsuCoverageNodeIdToIndex.find (pr.rsuNodeId);
+                      std::string rsuLabel = (idxIt != rsuCoverageNodeIdToIndex.end ())
+                                                ? ("rsu" + std::to_string (idxIt->second))
+                                                : ("node" + std::to_string (pr.rsuNodeId));
+                      rsuCoverageOfs << t << "," << rsuLabel
+                                     << "," << liveCount
+                                     << "," << pr.txCount
+                                     << "," << coveredLive
+                                     << ",";
+                      if (addressed && liveCount > 0)
+                        {
+                          rsuCoverageOfs << (static_cast<double> (coveredLive) / liveCount);
+                        }
+                      rsuCoverageOfs << "," << (addressed ? 1 : 0) << std::endl;
+                    }
+                }
+
+              bool overallAddressed = totalTx > 0;
+              if (rsuCoverageOfs.is_open ())
+                {
+                  rsuCoverageOfs << t << ",ALL"
+                                 << "," << liveCount
+                                 << "," << totalTx
+                                 << "," << unionDecodedLive.size ()
+                                 << ",";
+                  if (overallAddressed && liveCount > 0)
+                    {
+                      rsuCoverageOfs << (static_cast<double> (unionDecodedLive.size ()) / liveCount);
+                    }
+                  rsuCoverageOfs << "," << (overallAddressed ? 1 : 0) << std::endl;
+                }
+            }
         });
     }
 
