@@ -108,8 +108,13 @@ public:
   // why it is shared rather than a parallel map. groupAddr/port must match
   // where the vehicles' V2xGossipApp is bound, or an RSU-originated
   // envelope will reach the sidelink but find no application listening.
+  // onSend, if set, is invoked every time this RSU's dispatch lambda
+  // actually sends a packet -- e.g. so a caller in a module traci does not
+  // depend on (nr) can count transmission attempts without traci itself
+  // taking that dependency.
   void RegisterRsuSend(const std::string& rsuId, Ptr<Socket> socket,
-                       Ipv4Address groupAddr, uint16_t port);
+                       Ipv4Address groupAddr, uint16_t port,
+                       std::function<void()> onSend = nullptr);
 
   std::vector<std::string> getVehicleNodeMapIds(); // get all vehicle node ids
 

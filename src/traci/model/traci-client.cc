@@ -1175,7 +1175,8 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
 
   void
   TraciClient::RegisterRsuSend(const std::string& rsuId, Ptr<Socket> socket,
-                                Ipv4Address groupAddr, uint16_t port)
+                                Ipv4Address groupAddr, uint16_t port,
+                                std::function<void()> onSend)
   {
     // DECISION: shared m_gossipSend, not a parallel dispatch map. The
     // existing lookup in ProcessGossipIn (m_gossipSend.find(sumo_id)) is
@@ -1197,9 +1198,17 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
     // gossip app" density proxy -- that call site is adjusted (see
     // m_rsuSumoIds) to subtract RSU entries so it keeps meaning what its
     // name says.
-    m_gossipSend[rsuId] = [socket, groupAddr, port] (const uint8_t* data, uint32_t len) {
+    // onSend is an optional hook (RSU coverage instrumentation uses it to
+    // count transmission attempts at the point they actually happen,
+    // without traci depending on the nr module -- see nr-sl-rsu-coverage.h
+    // and its call site in the automotive example, which is the only
+    // place that both knows the ns-3 Node ID behind an RSU socket and
+    // already links against libnr). Left null-checked so RegisterRsuSend
+    // itself has no opinion on what, if anything, gets notified.
+    m_gossipSend[rsuId] = [socket, groupAddr, port, onSend] (const uint8_t* data, uint32_t len) {
         Ptr<Packet> pkt = Create<Packet> (data, len);
         socket->SendTo (pkt, 0, InetSocketAddress (groupAddr, port));
+        if (onSend) onSend ();
       };
     m_rsuSumoIds.insert (rsuId);
   }
