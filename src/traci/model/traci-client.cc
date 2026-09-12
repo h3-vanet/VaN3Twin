@@ -1280,6 +1280,25 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
     m_rsuDeliveryLogPath = path;
   }
 
+  void
+  TraciClient::NotifySidelinkTransmit(uint32_t nodeId)
+  {
+    if (!m_sidelinkTransmitterIds.insert(nodeId).second)
+      {
+        return; // already seen this node transmit -- no-op, not a re-check
+      }
+    if (m_sidelinkTransmitterIds.size() > 255)
+      {
+        NS_FATAL_ERROR("[nr-sl] source-id space exhausted: "
+                       << m_sidelinkTransmitterIds.size()
+                       << " distinct transmitters have now transmitted on the sidelink "
+                       << "(SCI Format-2 source id is 8 bits; at most 255 distinct "
+                       << "transmitters can coexist without aliasing mod 256). "
+                       << "Reduce the concurrently-active vehicle/RSU population, "
+                       << "or shorten the run.");
+      }
+  }
+
   TraciClient::NearestRsu
   TraciClient::FindNearestRsu(const Vector& pos)
   {
@@ -1498,6 +1517,21 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
             std::cout << "[gossip-in] DROP: no GossipApp for sumo_id=" << dispatch_id << std::endl;
             continue;
           }
+
+        // Running source-id guard (see NotifySidelinkTransmit): this is the
+        // ACTUAL transmit point, not node construction -- dispatch_id is
+        // either the sending vehicle's own id or the relaying/forwarding
+        // RSU's id, both keys into m_NodeMap, so this one call site covers
+        // every category of sidelink TX that goes through gossip dispatch
+        // (peer gossip, downlink relay, uplink) without needing a hook per
+        // category.
+        {
+          auto dispatchNodeIt = m_NodeMap.find(dispatch_id);
+          if (dispatchNodeIt != m_NodeMap.end())
+            {
+              NotifySidelinkTransmit(dispatchNodeIt->second.second->GetId());
+            }
+        }
 
         // Forward the full envelope bytes — V2xGossipApp broadcasts them via NR-V2X
         it->second(buf, static_cast<uint32_t>(rc));

@@ -113,12 +113,19 @@ GetSlBitmapFromString (std::string slBitMapString, std::vector <std::bitset<1> >
  * beacon under EnableBlindReTx (see nr-sl-beacon-coverage.h).
  */
 void
-ScheduleSlBeaconTx (Ptr<Socket> socket, Ipv4Address groupAddr, uint16_t port, uint32_t payloadBytes)
+ScheduleSlBeaconTx (Ptr<Socket> socket, Ipv4Address groupAddr, uint16_t port, uint32_t payloadBytes,
+                    Ptr<TraciClient> sumoClient, uint32_t beaconNodeId)
 {
   NrSlBeaconCoverageStartNewBeacon ();
+  // The beacon transmits over its own raw socket, outside TraciClient's
+  // gossip dispatch entirely, so it is the one sidelink transmitter the
+  // running source-id guard (TraciClient::NotifySidelinkTransmit) cannot
+  // see on its own -- register it explicitly here, at its actual TX site.
+  sumoClient->NotifySidelinkTransmit (beaconNodeId);
   Ptr<Packet> pkt = Create<Packet> (payloadBytes);
   socket->SendTo (pkt, 0, InetSocketAddress (groupAddr, port));
-  Simulator::Schedule (Seconds (1.0), &ScheduleSlBeaconTx, socket, groupAddr, port, payloadBytes);
+  Simulator::Schedule (Seconds (1.0), &ScheduleSlBeaconTx, socket, groupAddr, port, payloadBytes,
+                       sumoClient, beaconNodeId);
 }
 
 
@@ -473,33 +480,23 @@ main (int argc, char *argv[])
     }
   NS_LOG_INFO("The .rou file has been read: " << numberOfNodes << " vehicles will be present in the simulation.");
 
-  // SCI Format-2 carries an 8-bit source id (see nr-sl-sci-f2-header.cc,
-  // fed by nr-sl-helper.cc's SetSourceL2Id(imsi & 0xFFFFFF), where IMSI is
-  // handed out sequentially in device-install order across every node that
-  // gets an NR-V2X sidelink device: the vehicle pool, then the coverage
-  // beacon (if any), then the RSUs). Past ~256 distinct transmitters, IMSI
-  // values collide mod 256 on the wire and the RX-side decode logic that
-  // assumes a unique 8-bit source id per transmitter corrupts state
-  // (observed as a SIGSEGV around 251-254 cumulative vehicles even before
-  // RSUs existed). This is a known limitation of the 8-bit SCI field, not
-  // something fixable from this scenario file -- so fail loudly here,
-  // before any node/device is constructed, instead of segfaulting deep
-  // inside the NR PHY once the pool is exhausted. All three quantities
-  // (vehicle pool size, --rsu-count, --beacon) are already known at this
-  // point, so this check is a single comparison with no runtime tracking.
-  {
-    uint32_t totalSidelinkTransmitters =
-        static_cast<uint32_t> (numberOfNodes) + rsuCount + (enableBeacon ? 1u : 0u);
-    if (totalSidelinkTransmitters > 255)
-      {
-        NS_FATAL_ERROR ("[nr-sl] source-id space exhausted: " << totalSidelinkTransmitters
-                        << " transmitters (vehicle pool=" << numberOfNodes
-                        << ", rsu-count=" << rsuCount
-                        << ", beacon=" << (enableBeacon ? 1 : 0)
-                        << "); SCI Format-2 source id is 8 bits (max 255 distinct "
-                        << "transmitters). Reduce the vehicle pool and/or --rsu-count.");
-      }
-  }
+  // SCI Format-2's 8-bit source id (see nr-sl-sci-f2-header.cc, fed by
+  // nr-sl-helper.cc's SetSourceL2Id(imsi & 0xFFFFFF)) is guarded at
+  // runtime, not here: a preallocated pool bigger than 255 nodes (vehicle
+  // pool + --rsu-count + --beacon) does NOT by itself mean this run will
+  // hit the alias-collision SIGSEGV -- every pool node gets an L2 id at
+  // construction regardless of whether it ever transmits, but the crash
+  // needs two ALIASING nodes to actually both be transmitting/decoding
+  // during this run, which is a function of simulated time and traffic,
+  // not pool size. A check here on numberOfNodes alone would both miss
+  // cases (two aliasing nodes among a pool under 255 could still exist if
+  // rsu-count/beacon push it over, which IS still caught by that sum) and
+  // spuriously abort perfectly fine runs (a big pool sized for a long
+  // campaign, sliced down to a short --simTime that only ever exercises a
+  // fraction of it). See TraciClient::NotifySidelinkTransmit for the
+  // actual guard: a running count of nodes that have ACTUALLY
+  // transmitted, checked as they start transmitting.
+
   /*
    * Create a NodeContainer for all the UEs
    */
@@ -1422,7 +1419,8 @@ main (int argc, char *argv[])
   // transmission is kicked off here, after coverage-counting is enabled.
   if (enableBeacon)
     {
-      ScheduleSlBeaconTx (beaconSocket, groupAddress4, port, beaconPayloadBytes);
+      ScheduleSlBeaconTx (beaconSocket, groupAddress4, port, beaconPayloadBytes,
+                          sumoClient, beaconNode->GetId ());
     }
 
   /* Send static polygon overlays (parking spots, H3 cells, ...) to the visualizer.

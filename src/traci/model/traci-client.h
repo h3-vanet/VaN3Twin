@@ -135,6 +135,28 @@ public:
   // unaffected and no file is produced.
   void EnableRsuDeliveryLog(const std::string& path);
 
+  // SCI Format-2's source id is 8 bits, so at most 255 distinct sidelink
+  // transmitters can coexist without two of them aliasing mod 256 (see
+  // nr-sl-sci-f2-header.cc). This is NOT a startup/pool-size check: IMSIs
+  // (and therefore L2/source ids) are assigned to every pool node at
+  // construction regardless of whether that node ever actually transmits,
+  // but the observed SIGSEGV requires two ALIASING nodes to both actually
+  // be transmitting/decoding at the same time -- a preallocated pool can
+  // be larger than 255 nodes and still run to completion if a given run
+  // never actually exercises more than 255 of them, and conversely a
+  // run's total pool size alone says nothing about when (or whether) that
+  // threshold is crossed during THIS run. So this is called at the one
+  // place that already knows a node has just gone from "silent" to
+  // "actually transmitting on the sidelink" -- see the call site in
+  // ProcessGossipIn (covers every vehicle send, RSU downlink relay, and
+  // RSU uplink forward, since they all share that one dispatch call) and
+  // the coverage-probe beacon's own TX site in the scenario file. A
+  // caller like the beacon that transmits from a Node not otherwise
+  // known to TraciClient is expected to call this itself once it starts.
+  // Idempotent per node id; the abort only ever fires the first time the
+  // 256th DISTINCT node is seen actually transmitting, not on every call.
+  void NotifySidelinkTransmit(uint32_t nodeId);
+
   std::vector<std::string> getVehicleNodeMapIds(); // get all vehicle node ids
 
   std::map< std::string, std::pair< StationType_t, Ptr<Node> > > get_NodeMap() {return m_NodeMap;};
@@ -321,6 +343,10 @@ private:
     double      tRx {-1.0};
     double      latencyMs {-1.0};
   };
+  // See NotifySidelinkTransmit(): distinct ns-3 Node IDs seen actually
+  // transmitting on the sidelink so far this run.
+  std::unordered_set<uint32_t> m_sidelinkTransmitterIds;
+
   std::vector<RsuDeliveryRow> m_rsuDeliveryRows;
   // Index into m_rsuDeliveryRows, keyed by "d:<msg_id>" / "u:<msg_id>" so
   // the two directions' id spaces can never collide even if the Rust side
