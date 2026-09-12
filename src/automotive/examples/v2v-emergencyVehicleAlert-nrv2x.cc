@@ -150,6 +150,32 @@ DefaultRsuCoverageLogPath (const std::string &prefix)
   return oss.str ();
 }
 
+/**
+ * \brief Default path for the per-run RSU delivery-metric CSV (see the
+ *        "OUTPUT" block in main()). Same convention as
+ *        DefaultRsuCoverageLogPath() above, just a different, separate
+ *        output file -- the two mechanisms measure different things (see
+ *        the rsu_delivery.csv instrumentation comment in TraciClient) and
+ *        neither should overwrite the other's default filename.
+ */
+std::string
+DefaultRsuDeliveryLogPath (const std::string &prefix)
+{
+  std::time_t t = std::time (nullptr);
+  std::tm *tm = std::localtime (&t);
+  std::ostringstream oss;
+  oss << prefix << "-rsu-delivery."
+      << (tm->tm_year + 1900)
+      << (tm->tm_mon + 1 < 10 ? "0" : "") << (tm->tm_mon + 1)
+      << (tm->tm_mday < 10 ? "0" : "") << tm->tm_mday << "-"
+      << (tm->tm_hour < 10 ? "0" : "") << tm->tm_hour
+      << (tm->tm_min < 10 ? "0" : "") << tm->tm_min
+      << (tm->tm_sec < 10 ? "0" : "") << tm->tm_sec
+      << "." << getpid ()
+      << ".csv";
+  return oss.str ();
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -213,6 +239,9 @@ main (int argc, char *argv[])
   // Per-run RSU coverage CSV path. Empty (the default) means "derive one
   // from log_prefix + PID + timestamp" -- see DefaultRsuCoverageLogPath().
   std::string rsuCoverageLogPath;
+  // Per-run RSU delivery-metric CSV path (see TraciClient::EnableRsuDeliveryLog).
+  // Same empty-means-derive convention as rsuCoverageLogPath above.
+  std::string rsuDeliveryLogPath;
 
   xmlDocPtr rou_xml_file;
   double m_baseline_prr = 150.0;
@@ -369,6 +398,16 @@ main (int argc, char *argv[])
                 "concurrent same-day runs each get their own file instead "
                 "of interleaving in the shared rolling log.",
                 rsuCoverageLogPath);
+  cmd.AddValue ("rsu-delivery-log",
+                "Per-run CSV file for the uplink/downlink RSU delivery "
+                "metric (only used when --rsu-count > 0) -- one row per "
+                "(envelope, intended recipient) for downlink and one row "
+                "per uplink message, matched TX/RX by the msg_id the wire "
+                "envelope carries. Separate from --rsu-coverage-log, which "
+                "counts any decoder of any RSU transmission with no notion "
+                "of an intended recipient. Same default-path convention as "
+                "--rsu-coverage-log.",
+                rsuDeliveryLogPath);
 
 
   // Parse the command line
@@ -433,6 +472,34 @@ main (int argc, char *argv[])
       NS_FATAL_ERROR("Fatal error: cannot gather the number of vehicles from the specified XML file: "<<path<<". Please check if it is a correct SUMO file.");
     }
   NS_LOG_INFO("The .rou file has been read: " << numberOfNodes << " vehicles will be present in the simulation.");
+
+  // SCI Format-2 carries an 8-bit source id (see nr-sl-sci-f2-header.cc,
+  // fed by nr-sl-helper.cc's SetSourceL2Id(imsi & 0xFFFFFF), where IMSI is
+  // handed out sequentially in device-install order across every node that
+  // gets an NR-V2X sidelink device: the vehicle pool, then the coverage
+  // beacon (if any), then the RSUs). Past ~256 distinct transmitters, IMSI
+  // values collide mod 256 on the wire and the RX-side decode logic that
+  // assumes a unique 8-bit source id per transmitter corrupts state
+  // (observed as a SIGSEGV around 251-254 cumulative vehicles even before
+  // RSUs existed). This is a known limitation of the 8-bit SCI field, not
+  // something fixable from this scenario file -- so fail loudly here,
+  // before any node/device is constructed, instead of segfaulting deep
+  // inside the NR PHY once the pool is exhausted. All three quantities
+  // (vehicle pool size, --rsu-count, --beacon) are already known at this
+  // point, so this check is a single comparison with no runtime tracking.
+  {
+    uint32_t totalSidelinkTransmitters =
+        static_cast<uint32_t> (numberOfNodes) + rsuCount + (enableBeacon ? 1u : 0u);
+    if (totalSidelinkTransmitters > 255)
+      {
+        NS_FATAL_ERROR ("[nr-sl] source-id space exhausted: " << totalSidelinkTransmitters
+                        << " transmitters (vehicle pool=" << numberOfNodes
+                        << ", rsu-count=" << rsuCount
+                        << ", beacon=" << (enableBeacon ? 1 : 0)
+                        << "); SCI Format-2 source id is 8 bits (max 255 distinct "
+                        << "transmitters). Reduce the vehicle pool and/or --rsu-count.");
+      }
+  }
   /*
    * Create a NodeContainer for all the UEs
    */
@@ -735,6 +802,11 @@ main (int argc, char *argv[])
   NodeContainer rsuNodeContainer;
   NetDeviceContainer rsuNetDeviceContainer;
   std::vector<Ptr<Socket>> rsuSockets;
+  // RSU uplink RECEIVE path (vehicle -> broker, over the same sidelink
+  // groupcast vehicles already use): one V2xGossipApp per RSU, RX-only --
+  // its own Send() is never called, RSU TX still goes through rsuSockets
+  // above. See TraciClient::RegisterRsuReceive.
+  ApplicationContainer rsuGossipApps;
 
   /*
    * if enableOneTxPerLane is true:
@@ -925,6 +997,21 @@ main (int argc, char *argv[])
           rsuSockets[r]->SetAllowBroadcast (true);
           rsuSockets[r]->Bind (InetSocketAddress (Ipv4Address::GetAny (), port));
         }
+
+      // RSU uplink RECEIVE path: a V2xGossipApp per RSU bound to
+      // gossipPort -- the SAME port vehicles' own V2xGossipApp is bound
+      // to and transmits their uplink groupcast on (see the port-mismatch
+      // note on "port" (8000, RSU TX's own local bind) vs. "gossipPort"
+      // (8001, where everyone actually listens) a few lines above). Only
+      // installed here (device/app construction); wiring the RX callback
+      // to TraciClient::RegisterRsuReceive happens below once sumoClient
+      // and the "rsuN" ids exist, alongside the existing RegisterRsuSend
+      // call for the same RSU.
+      V2xGossipAppHelper rsuGossipHelper;
+      rsuGossipHelper.SetAttribute ("Port", UintegerValue (gossipPort));
+      rsuGossipApps = rsuGossipHelper.Install (rsuNodeContainer);
+      rsuGossipApps.Start (Seconds (0.0));
+      rsuGossipApps.Stop (Seconds (simTime));
     }
 
   // enable log component
@@ -1124,6 +1211,13 @@ main (int argc, char *argv[])
           sumoClient->RegisterRsuSend (rsuId, rsuSockets[r], groupAddress4, gossipPort,
                                         [rsuNodeId] () { NrSlRsuCoverageNotifyTx (rsuNodeId); });
 
+          // Uplink (vehicle -> broker): wire this RSU's receiving
+          // V2xGossipApp (installed above, in the device-construction
+          // block) so a broker-bound message it decodes gets forwarded to
+          // the broker -- see TraciClient::RegisterRsuReceive/
+          // OnRsuUplinkReceived.
+          sumoClient->RegisterRsuReceive (rsuId, rsuGossipApps.Get (r));
+
           libsumo::TraCIPosition rsuLonLat = sumoClient->simulation.convertXYtoLonLat (rsuX, rsuY);
           std::cerr << "[nr-rsu] index=" << r
                      << " node=" << rsuNodeContainer.Get (r)->GetId ()
@@ -1195,6 +1289,29 @@ main (int argc, char *argv[])
           std::cerr << "[nr-rsu-coverage] WARNING: could not open " << rsuCoverageLogPath << std::endl;
         }
       std::cerr << "[nr-rsu-coverage] logging to " << rsuCoverageLogPath << std::endl;
+    }
+
+  /*
+   * RSU delivery-metric CSV (see TraciClient::EnableRsuDeliveryLog and the
+   * OUTPUT block in the task this implements): separate mechanism from
+   * rsu_coverage.csv above, so its own gating condition is intentionally
+   * spelled out again as "rsuCount > 0" rather than reusing
+   * rsuCoverageEnabled -- the two are only coincidentally the same
+   * condition today, and rsu_coverage.csv's 100 already-completed runs
+   * must not gain a dependency on this new feature or vice versa. Calling
+   * EnableRsuDeliveryLog() here (before Simulator::Run()) is safe even
+   * though sumoClient->SumoSetup() already ran above: nothing in
+   * TraciClient acts on gossip traffic until SumoSimulationStep actually
+   * fires, which cannot happen before Simulator::Run().
+   */
+  if (rsuCount > 0)
+    {
+      if (rsuDeliveryLogPath.empty ())
+        {
+          rsuDeliveryLogPath = DefaultRsuDeliveryLogPath (log_prefix);
+        }
+      sumoClient->EnableRsuDeliveryLog (rsuDeliveryLogPath);
+      std::cerr << "[rsu-delivery] logging to " << rsuDeliveryLogPath << std::endl;
     }
 
   if (beaconNodeId >= 0 || rsuCoverageEnabled)
