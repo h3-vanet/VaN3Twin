@@ -296,6 +296,13 @@ namespace ns3
         m_logThread.join();
       }
 
+    // Flush the rsu_delivery.csv instrumentation (if enabled) before
+    // tearing down ZMQ -- writing it needs none of these sockets, but it
+    // must happen while m_rsuDeliveryRows is still populated, and this is
+    // the one place both the leaderless (SumoStop never called with it
+    // enabled) and broker arms reliably pass through at end of sim.
+    WriteRsuDeliveryLog();
+
     if (m_zmq_gossip_in != nullptr)
       {
         zmq_close(m_zmq_gossip_in);
@@ -305,6 +312,11 @@ namespace ns3
       {
         zmq_close(m_zmq_gossip_out);
         m_zmq_gossip_out = nullptr;
+      }
+    if (m_zmq_uplink_out != nullptr)
+      {
+        zmq_close(m_zmq_uplink_out);
+        m_zmq_uplink_out = nullptr;
       }
     if (m_zmq_cmd != nullptr)
       {
@@ -492,9 +504,11 @@ namespace ns3
     const int portCmd       = envInt("ZMQ_CMD_PORT",        5558) + zmqPortOffset;
     const int portGossipIn  = envInt("ZMQ_GOSSIP_IN_PORT",  5560) + zmqPortOffset;
     const int portGossipOut = envInt("ZMQ_GOSSIP_OUT_PORT", 5561) + zmqPortOffset;
+    const int portUplinkOut = envInt("ZMQ_UPLINK_OUT_PORT", 5562) + zmqPortOffset;
 
     std::cout << "[zmq] ports: pub=" << portPub << " cmd=" << portCmd
               << " gossip_in=" << portGossipIn << " gossip_out=" << portGossipOut
+              << " uplink_out=" << portUplinkOut
               << " traci=" << m_sumoPort
               << " (offset=" << zmqPortOffset << ")" << std::endl;
 
@@ -565,6 +579,23 @@ namespace ns3
         else
           {
             std::cout << "[zmq] GOSSIP PUSH bound on " << addrGossipOut << std::endl;
+          }
+
+        // RSU -> broker uplink backhaul (see m_zmq_uplink_out in the
+        // header for why this link is left ideal/wired rather than
+        // simulated over the radio).
+        m_zmq_uplink_out = zmq_socket(m_zmq_context, ZMQ_PUSH);
+        zmq_setsockopt(m_zmq_uplink_out, ZMQ_SNDHWM, &hwm, sizeof(hwm));
+        std::string addrUplinkOut = "tcp://*:" + std::to_string(portUplinkOut);
+        if (zmq_bind(m_zmq_uplink_out, addrUplinkOut.c_str()) != 0)
+          {
+            NS_LOG_WARN("TraciClient: ZMQ bind on " << addrUplinkOut << " failed: " << zmq_strerror(errno));
+            zmq_close(m_zmq_uplink_out);
+            m_zmq_uplink_out = nullptr;
+          }
+        else
+          {
+            std::cout << "[zmq] UPLINK PUSH bound on " << addrUplinkOut << std::endl;
           }
       }
 
@@ -1228,6 +1259,66 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
   }
 
   void
+  TraciClient::RegisterRsuReceive(const std::string& rsuId, Ptr<Application> appBase)
+  {
+    Ptr<V2xGossipApp> app = appBase->GetObject<V2xGossipApp>();
+    if (!app) return;
+    // RX-only: this RSU's Send() is never invoked through this app -- its
+    // outbound (broker -> vehicle) traffic keeps using the raw socket
+    // RegisterRsuSend already wired up. Deliberately not added to
+    // m_gossipSend for the same reason.
+    app->SetReceiveCallback(
+      [this, rsuId](const std::string& /*vehId*/, const uint8_t* data, uint32_t len) {
+        OnRsuUplinkReceived(rsuId, data, len);
+      });
+  }
+
+  void
+  TraciClient::EnableRsuDeliveryLog(const std::string& path)
+  {
+    m_rsuDeliveryEnabled = true;
+    m_rsuDeliveryLogPath = path;
+  }
+
+  void
+  TraciClient::NotifySidelinkTransmit(uint32_t nodeId)
+  {
+    if (!m_sidelinkTransmitterIds.insert(nodeId).second)
+      {
+        return; // already seen this node transmit -- no-op, not a re-check
+      }
+    if (m_sidelinkTransmitterIds.size() > 255)
+      {
+        NS_FATAL_ERROR("[nr-sl] source-id space exhausted: "
+                       << m_sidelinkTransmitterIds.size()
+                       << " distinct transmitters have now transmitted on the sidelink "
+                       << "(SCI Format-2 source id is 8 bits; at most 255 distinct "
+                       << "transmitters can coexist without aliasing mod 256). "
+                       << "Reduce the concurrently-active vehicle/RSU population, "
+                       << "or shorten the run.");
+      }
+  }
+
+  TraciClient::NearestRsu
+  TraciClient::FindNearestRsu(const Vector& pos)
+  {
+    NearestRsu result;
+    for (const auto &kv : m_NodeMap)
+      {
+        if (kv.second.first != StationType_roadSideUnit) continue;
+        Vector rsu_pos = kv.second.second->GetObject<MobilityModel> ()->GetPosition ();
+        double dist = CalculateDistance (pos, rsu_pos);
+        if (!result.have || dist < result.dist)
+          {
+            result.have = true;
+            result.dist = dist;
+            result.id = kv.first;
+          }
+      }
+    return result;
+  }
+
+  void
   TraciClient::ProcessGossipIn()
   {
     if (m_zmq_gossip_in == nullptr) return;
@@ -1328,31 +1419,47 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
               }
             Vector dest_pos = destNodeIt->second.second->GetObject<MobilityModel> ()->GetPosition ();
 
-            bool have_nearest = false;
-            double nearest_dist = 0.0;
-            std::string nearest_rsu_id;
-            for (const auto &kv : m_NodeMap)
-              {
-                if (kv.second.first != StationType_roadSideUnit) continue;
-                Vector rsu_pos = kv.second.second->GetObject<MobilityModel> ()->GetPosition ();
-                double dist = CalculateDistance (dest_pos, rsu_pos);
-                if (!have_nearest || dist < nearest_dist)
-                  {
-                    have_nearest = true;
-                    nearest_dist = dist;
-                    nearest_rsu_id = kv.first;
-                  }
-              }
+            NearestRsu nearest = FindNearestRsu (dest_pos);
 
-            if (have_nearest)
+            if (nearest.have)
               {
-                dispatch_id = nearest_rsu_id;
+                dispatch_id = nearest.id;
               }
             // else: no RSU nodes exist at all (--rsu-count=0). Leave
             // dispatch_id as the broker's placeholder id -- no send
             // callback is registered under that key either, so this falls
             // through to the existing "no GossipApp" DROP below with an
             // accurate message.
+
+            // rsu_delivery.csv TX-side row (downlink): logged here, not at
+            // the actual socket SendTo below, because this is the one
+            // place that already has the destination vehicle's resolved
+            // node and the nearest-RSU distance computed for dispatch --
+            // exactly the fields the row needs. See EnableRsuDeliveryLog.
+            if (m_rsuDeliveryEnabled)
+              {
+                std::string search = "\"msg_id\":";
+                size_t mp = msg.find (search);
+                uint64_t msg_id = 0;
+                if (mp != std::string::npos)
+                  {
+                    try { msg_id = std::stoull (msg.substr (mp + search.size ())); } catch (...) {}
+                  }
+                if (msg_id != 0)
+                  {
+                    RsuDeliveryRow row;
+                    row.direction = 'd';
+                    row.msgId = msg_id;
+                    row.tTx = Simulator::Now ().GetSeconds ();
+                    row.srcNode = "broker";
+                    row.dst = std::to_string (destNodeIt->second.second->GetId ());
+                    row.servingRsu = nearest.have ? nearest.id : "";
+                    row.distM = nearest.have ? nearest.dist : -1.0;
+                    row.vehicleLiveAtTx = true;
+                    m_rsuDeliveryIndex["d:" + std::to_string (msg_id)] = m_rsuDeliveryRows.size ();
+                    m_rsuDeliveryRows.push_back (row);
+                  }
+              }
           }
         else if (sender_id != 0)
           {
@@ -1364,12 +1471,67 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
             m_sumo_to_u64[sumo_id] = sender_id;
           }
 
+        // Uplink (vehicle -> broker): a vehicle's claim/query enters here
+        // exactly like ordinary peer gossip (sumo_id is the vehicle's own
+        // real id, dispatch_id is left unchanged above, and the broadcast
+        // below is byte-for-byte the same call every gossip send already
+        // makes) -- the ONLY difference is this envelope carries a
+        // "dst":"broker" marker the sender added, which nothing here acts
+        // on except the delivery-log bookkeeping. No nearest-RSU
+        // addressing happens on TX: it goes out as an ordinary sidelink
+        // groupcast and ANY RSU that decodes it forwards it (see
+        // OnRsuUplinkReceived) -- that is what makes several RSUs decoding
+        // the same message possible/expected, not a bug.
+        if (m_rsuDeliveryEnabled && !is_broker_envelope
+            && msg.find ("\"dst\":\"broker\"") != std::string::npos)
+          {
+            std::string search = "\"msg_id\":";
+            size_t mp = msg.find (search);
+            uint64_t msg_id = 0;
+            if (mp != std::string::npos)
+              {
+                try { msg_id = std::stoull (msg.substr (mp + search.size ())); } catch (...) {}
+              }
+            auto srcNodeIt = m_NodeMap.find (sumo_id);
+            if (msg_id != 0 && srcNodeIt != m_NodeMap.end ())
+              {
+                Vector src_pos = srcNodeIt->second.second->GetObject<MobilityModel> ()->GetPosition ();
+                NearestRsu nearest = FindNearestRsu (src_pos);
+
+                RsuDeliveryRow row;
+                row.direction = 'u';
+                row.msgId = msg_id;
+                row.tTx = Simulator::Now ().GetSeconds ();
+                row.srcNode = std::to_string (srcNodeIt->second.second->GetId ());
+                row.dst = "broker";
+                row.distM = nearest.have ? nearest.dist : -1.0;
+                row.vehicleLiveAtTx = true;
+                m_rsuDeliveryIndex["u:" + std::to_string (msg_id)] = m_rsuDeliveryRows.size ();
+                m_rsuDeliveryRows.push_back (row);
+              }
+          }
+
         auto it = m_gossipSend.find(dispatch_id);
         if (it == m_gossipSend.end())
           {
             std::cout << "[gossip-in] DROP: no GossipApp for sumo_id=" << dispatch_id << std::endl;
             continue;
           }
+
+        // Running source-id guard (see NotifySidelinkTransmit): this is the
+        // ACTUAL transmit point, not node construction -- dispatch_id is
+        // either the sending vehicle's own id or the relaying/forwarding
+        // RSU's id, both keys into m_NodeMap, so this one call site covers
+        // every category of sidelink TX that goes through gossip dispatch
+        // (peer gossip, downlink relay, uplink) without needing a hook per
+        // category.
+        {
+          auto dispatchNodeIt = m_NodeMap.find(dispatch_id);
+          if (dispatchNodeIt != m_NodeMap.end())
+            {
+              NotifySidelinkTransmit(dispatchNodeIt->second.second->GetId());
+            }
+        }
 
         // Forward the full envelope bytes — V2xGossipApp broadcasts them via NR-V2X
         it->second(buf, static_cast<uint32_t>(rc));
@@ -1459,6 +1621,41 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
     }
     bool isBrokerDelivery = (originSumoId.rfind ("rsu", 0) == 0);
 
+    // rsu_delivery.csv RX-side completion (downlink): this callback fires
+    // for EVERY vehicle that decodes the RSU's transmission, not just the
+    // intended recipient (it is a groupcast) -- so only mark the pending
+    // row delivered when receiverSumoId is the specific vehicle the TX
+    // side (ProcessGossipIn) resolved and logged as "dst" for this
+    // msg_id. A bystander decoding the same transmission is correctly
+    // ignored here: it is not what "delivered" means for this metric.
+    if (isBrokerDelivery && m_rsuDeliveryEnabled)
+      {
+        std::string search = "\"msg_id\":";
+        size_t mp = envelope.find (search);
+        uint64_t msg_id = 0;
+        if (mp != std::string::npos)
+          {
+            try { msg_id = std::stoull (envelope.substr (mp + search.size ())); } catch (...) {}
+          }
+        if (msg_id != 0)
+          {
+            auto idxIt = m_rsuDeliveryIndex.find ("d:" + std::to_string (msg_id));
+            auto recvNodeIt = m_NodeMap.find (receiverSumoId);
+            if (idxIt != m_rsuDeliveryIndex.end () && recvNodeIt != m_NodeMap.end ())
+              {
+                RsuDeliveryRow &row = m_rsuDeliveryRows[idxIt->second];
+                std::string recvNodeIdStr = std::to_string (recvNodeIt->second.second->GetId ());
+                if (!row.delivered && row.dst == recvNodeIdStr)
+                  {
+                    row.delivered = true;
+                    row.nDecoders = 1;
+                    row.tRx = Simulator::Now ().GetSeconds ();
+                    row.latencyMs = (row.tRx - row.tTx) * 1000.0;
+                  }
+              }
+          }
+      }
+
     // Build outbound message: {"receiver_id":<u64>,"payload":<GossipMessage JSON>}
     // RETURN-LEG CONCLUSION: for ordinary peer gossip, receiver_id+payload
     // is unchanged and sufficient -- routing only ever depended on WHO
@@ -1511,6 +1708,135 @@ TraciClient::SetPerTickCallback (std::function<void(const std::vector<uint32_t>&
         gossip_drop_count++;
         std::cout << "[gossip-drop] out total=" << gossip_drop_count << std::endl;
       }
+  }
+
+  void
+  TraciClient::OnRsuUplinkReceived(const std::string& rsuId,
+                                   const uint8_t* data, uint32_t len)
+  {
+    std::string envelope(reinterpret_cast<const char*>(data), len);
+
+    // Gate on the "dst":"broker" marker only -- this RSU's receive app
+    // sits on the SAME groupcast vehicles use for ordinary peer gossip
+    // (no separate radio-level addressing for broker-bound traffic, see
+    // the design note in ProcessGossipIn), so most of what it decodes is
+    // not meant for the broker at all and must be silently ignored here,
+    // not forwarded.
+    if (envelope.find ("\"dst\":\"broker\"") == std::string::npos)
+      {
+        return;
+      }
+
+    std::string search = "\"msg_id\":";
+    size_t mp = envelope.find (search);
+    uint64_t msg_id = 0;
+    if (mp != std::string::npos)
+      {
+        try { msg_id = std::stoull (envelope.substr (mp + search.size ())); } catch (...) {}
+      }
+    if (msg_id == 0)
+      {
+        std::cout << "[uplink-rx] DROP: broker-bound envelope with no msg_id, rsu=" << rsuId << std::endl;
+        return;
+      }
+
+    // RSU -> broker backhaul (ideal/wired, see m_zmq_uplink_out): forward
+    // every copy this RSU decodes, annotated with which RSU it came from.
+    // Deliberately NOT deduplicated against other RSUs here -- several
+    // RSUs decoding the same uplink message is expected, and the broker
+    // (keyed by msg_id) is where that fan-in gets resolved; the duplicate
+    // count itself is a measurement this change is meant to expose, not
+    // hide.
+    if (m_zmq_uplink_out != nullptr)
+      {
+        std::string out = "{\"rsu_id\":\"" + rsuId + "\",\"envelope\":" + envelope + "}";
+        int rc = zmq_send (m_zmq_uplink_out, out.c_str (), out.size (), ZMQ_DONTWAIT);
+        if (rc == -1 && errno != EAGAIN)
+          {
+            std::cout << "[uplink-drop] rsu=" << rsuId << " msg_id=" << msg_id << std::endl;
+          }
+      }
+
+    if (!m_rsuDeliveryEnabled)
+      {
+        return;
+      }
+
+    auto idxIt = m_rsuDeliveryIndex.find ("u:" + std::to_string (msg_id));
+    if (idxIt == m_rsuDeliveryIndex.end ())
+      {
+        // TX side never logged a pending row for this id (delivery log
+        // was enabled after this message was sent, or the sender didn't
+        // include msg_id/dst correctly) -- nothing to complete.
+        return;
+      }
+    RsuDeliveryRow &row = m_rsuDeliveryRows[idxIt->second];
+
+    // First decode only, PER RSU: a blind retransmission of the same TB
+    // could in principle surface as a second Receive() at this same RSU.
+    // This is the within-node dedup the task asks for; it is orthogonal
+    // to (and does not suppress) a DIFFERENT RSU also decoding this
+    // message, which is exactly what decodingRsus/nDecoders is counting.
+    if (!row.decodingRsus.insert (rsuId).second)
+      {
+        return;
+      }
+    row.nDecoders = static_cast<uint32_t> (row.decodingRsus.size ());
+    if (!row.delivered)
+      {
+        row.delivered = true;
+        row.tRx = Simulator::Now ().GetSeconds ();
+        row.latencyMs = (row.tRx - row.tTx) * 1000.0;
+      }
+  }
+
+  void
+  TraciClient::WriteRsuDeliveryLog()
+  {
+    if (!m_rsuDeliveryEnabled) return;
+
+    std::ofstream ofs (m_rsuDeliveryLogPath, std::ofstream::trunc);
+    if (!ofs.is_open ())
+      {
+        std::cout << "[rsu-delivery] WARNING: could not open " << m_rsuDeliveryLogPath << std::endl;
+        return;
+      }
+
+    ofs << "direction,msg_id,t_tx,src_node,dst,serving_rsu,decoding_rsus,"
+           "n_decoders,dist_m,vehicle_live_at_tx,delivered,t_rx,latency_ms" << std::endl;
+
+    for (const auto &row : m_rsuDeliveryRows)
+      {
+        std::string decodingRsus;
+        {
+          bool first = true;
+          for (const auto &r : row.decodingRsus)
+            {
+              if (!first) decodingRsus += ";";
+              decodingRsus += r;
+              first = false;
+            }
+        }
+
+        ofs << (row.direction == 'd' ? "down" : "up") << ","
+            << row.msgId << ","
+            << row.tTx << ","
+            << row.srcNode << ","
+            << row.dst << ","
+            << row.servingRsu << ","
+            << decodingRsus << ","
+            << row.nDecoders << ",";
+        if (row.distM >= 0.0) ofs << row.distM;
+        ofs << "," << (row.vehicleLiveAtTx ? 1 : 0)
+            << "," << (row.delivered ? 1 : 0) << ",";
+        if (row.tRx >= 0.0) ofs << row.tRx;
+        ofs << ",";
+        if (row.latencyMs >= 0.0) ofs << row.latencyMs;
+        ofs << std::endl;
+      }
+
+    std::cout << "[rsu-delivery] wrote " << m_rsuDeliveryRows.size ()
+              << " rows to " << m_rsuDeliveryLogPath << std::endl;
   }
 
   void

@@ -116,6 +116,47 @@ public:
                        Ipv4Address groupAddr, uint16_t port,
                        std::function<void()> onSend = nullptr);
 
+  // Register an RSU's RECEIVING application (a V2xGossipApp instance bound
+  // to the same group/port vehicles transmit their uplink on) so a
+  // broker-bound message it decodes gets forwarded to the broker. This is
+  // the symmetric counterpart to RegisterRsuSend: that one lets the broker
+  // reach a vehicle over sidelink, this one lets a vehicle's claim/query
+  // reach the broker over sidelink -- see OnRsuUplinkReceived. Unlike
+  // RegisterRsuSend, this does NOT touch m_gossipSend: an RSU never
+  // transmits from this app (its own Send() is never called), it only
+  // listens.
+  void RegisterRsuReceive(const std::string& rsuId, Ptr<Application> app);
+
+  // Turn on the rsu_delivery.csv instrumentation (see OUTPUT in the
+  // scenario file / nr-sl-rsu-coverage.h for the analogous rsu_coverage
+  // mechanism). Disabled by default: with this never called (i.e. every
+  // --rsu-count=0 run), every delivery-log code path below is a no-op
+  // gated on m_rsuDeliveryEnabled, so the leaderless arm is byte-for-byte
+  // unaffected and no file is produced.
+  void EnableRsuDeliveryLog(const std::string& path);
+
+  // SCI Format-2's source id is 8 bits, so at most 255 distinct sidelink
+  // transmitters can coexist without two of them aliasing mod 256 (see
+  // nr-sl-sci-f2-header.cc). This is NOT a startup/pool-size check: IMSIs
+  // (and therefore L2/source ids) are assigned to every pool node at
+  // construction regardless of whether that node ever actually transmits,
+  // but the observed SIGSEGV requires two ALIASING nodes to both actually
+  // be transmitting/decoding at the same time -- a preallocated pool can
+  // be larger than 255 nodes and still run to completion if a given run
+  // never actually exercises more than 255 of them, and conversely a
+  // run's total pool size alone says nothing about when (or whether) that
+  // threshold is crossed during THIS run. So this is called at the one
+  // place that already knows a node has just gone from "silent" to
+  // "actually transmitting on the sidelink" -- see the call site in
+  // ProcessGossipIn (covers every vehicle send, RSU downlink relay, and
+  // RSU uplink forward, since they all share that one dispatch call) and
+  // the coverage-probe beacon's own TX site in the scenario file. A
+  // caller like the beacon that transmits from a Node not otherwise
+  // known to TraciClient is expected to call this itself once it starts.
+  // Idempotent per node id; the abort only ever fires the first time the
+  // 256th DISTINCT node is seen actually transmitting, not on every call.
+  void NotifySidelinkTransmit(uint32_t nodeId);
+
   std::vector<std::string> getVehicleNodeMapIds(); // get all vehicle node ids
 
   std::map< std::string, std::pair< StationType_t, Ptr<Node> > > get_NodeMap() {return m_NodeMap;};
@@ -254,6 +295,73 @@ private:
 
   // See SetPerTickCallback().
   std::function<void(const std::vector<uint32_t>&)> m_perTickCallback;
+
+  // Uplink (vehicle -> broker) sidelink path -- see RegisterRsuReceive.
+  // Handles a broker-bound envelope ("dst":"broker") a specific RSU has
+  // decoded: forwards it over the (ideal, wired -- see SumoSetup) RSU ->
+  // broker backhaul and updates the delivery log below.
+  void   OnRsuUplinkReceived(const std::string& rsuId,
+                             const uint8_t* data, uint32_t len);
+
+  // RSU -> broker backhaul. This link is NOT modeled over the radio: an
+  // RSU's own connection back to the broker is assumed wired and ideal
+  // (the standard assumption for RSU backhaul), same as how the broker's
+  // ZMQ link to ns-3 itself is not part of the simulated radio. Only the
+  // vehicle <-> RSU hop over NR-V2X sidelink is what this change makes
+  // symmetric. PUSH (env ZMQ_UPLINK_OUT_PORT, default 5562) + ZMQ_PORT_OFFSET.
+  void*  m_zmq_uplink_out = nullptr;
+
+  // --- rsu_delivery.csv instrumentation (see EnableRsuDeliveryLog) ---
+  //
+  // Separate from nr-sl-rsu-coverage.h's coverage probe (which counts any
+  // live decoder of any RSU transmission, with no notion of an intended
+  // recipient): this tags each broker-bound/broker-originated envelope
+  // with the "msg_id" the wire envelope already carries (see
+  // ProcessGossipIn/OnRsuUplinkReceived) and matches TX against RX by that
+  // id, at the same application-layer reassembly point OnGossipReceived
+  // and the RSU's receive app already use for ordinary gossip -- i.e.
+  // "delivered" means the full envelope came back up through the UDP
+  // socket at the intended node, not "some decode happened in the same
+  // window". A msg_id of 0 is treated as absent (the request-id generator
+  // on the Rust side is assumed to never issue 0).
+  bool        m_rsuDeliveryEnabled = false;
+  std::string m_rsuDeliveryLogPath;
+
+  struct RsuDeliveryRow
+  {
+    char        direction {'d'};   // 'd' = down (broker->vehicle), 'u' = up (vehicle->broker)
+    uint64_t    msgId {0};
+    double      tTx {0.0};
+    std::string srcNode;           // down: "broker"; up: sending vehicle's ns-3 Node ID
+    std::string dst;               // down: recipient vehicle's ns-3 Node ID; up: "broker"
+    std::string servingRsu;        // down only -- the RSU selected to transmit
+    std::set<std::string> decodingRsus; // up only -- every distinct RSU that decoded it
+    uint32_t    nDecoders {0};     // up: decodingRsus.size(); down: 1 once delivered, else 0
+    double      distM {-1.0};      // vehicle-to-nearest-RSU distance at t_tx; -1 = no RSU existed
+    bool        vehicleLiveAtTx {false};
+    bool        delivered {false};
+    double      tRx {-1.0};
+    double      latencyMs {-1.0};
+  };
+  // See NotifySidelinkTransmit(): distinct ns-3 Node IDs seen actually
+  // transmitting on the sidelink so far this run.
+  std::unordered_set<uint32_t> m_sidelinkTransmitterIds;
+
+  std::vector<RsuDeliveryRow> m_rsuDeliveryRows;
+  // Index into m_rsuDeliveryRows, keyed by "d:<msg_id>" / "u:<msg_id>" so
+  // the two directions' id spaces can never collide even if the Rust side
+  // does not itself partition them.
+  std::unordered_map<std::string, size_t> m_rsuDeliveryIndex;
+
+  // Distance/id of the RSU nearest to a given position, scanning
+  // m_NodeMap the same way the existing broker-envelope dispatch above
+  // does -- factored out so the uplink delivery-log TX site (a vehicle's
+  // own position) and the downlink one (a destination vehicle's position)
+  // share one implementation instead of two copies of the same loop.
+  struct NearestRsu { bool have {false}; double dist {0.0}; std::string id; };
+  NearestRsu FindNearestRsu (const Vector& pos);
+
+  void WriteRsuDeliveryLog();
 
 };
 
