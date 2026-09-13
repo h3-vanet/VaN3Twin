@@ -775,9 +775,18 @@ namespace ns3
                   {
                     double speed = this->TraCIAPI::vehicle.getSpeed (node_ID);
                     char buf[256];
+                    // sim_time is ns-3's own simulation clock (seconds), not a
+                    // per-message wall-clock stamp: the Rust side has no other
+                    // access to simulated time, and needs one to time uplink
+                    // retries/leases against simulated (not wall-clock) elapsed
+                    // time — sim-to-wall drifts with vehicle density and load,
+                    // so a wall-clock timeout would be wrong in a way that
+                    // varies run to run. Identical for every vehicle at a given
+                    // step, so it can't drift between vehicles the way a
+                    // per-vehicle received-update counter would.
                     snprintf(buf, sizeof(buf),
-                        "{\"type\":\"GpsUpdate\",\"vehicle_id\":\"%s\",\"lat\":%.7f,\"lng\":%.7f,\"speed_ms\":%.3f}",
-                        node_ID.c_str(), lonlat.y, lonlat.x, speed);
+                        "{\"type\":\"GpsUpdate\",\"vehicle_id\":\"%s\",\"lat\":%.7f,\"lng\":%.7f,\"speed_ms\":%.3f,\"sim_time\":%.3f}",
+                        node_ID.c_str(), lonlat.y, lonlat.x, speed, Simulator::Now().GetSeconds());
                     zmqPublish(buf);
                   }
               }
